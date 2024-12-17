@@ -14,24 +14,25 @@
 # ==============================================================================
 """A minimal interface mlp module."""
 
-import types
-from typing import Callable, Iterable, Optional
+from collections.abc import Callable, Iterable
 
 from haiku._src import base
 from haiku._src import basic
 from haiku._src import initializers
 from haiku._src import module
 import jax
-import jax.numpy as jnp
 
-# If forking replace this block with `import haiku as hk`.
-hk = types.ModuleType("haiku")
-hk.Module = module.Module
-hk.initializers = initializers
-hk.get_parameter = base.get_parameter
-hk.PRNGSequence = base.PRNGSequence
-hk.Linear = basic.Linear
-hk.dropout = basic.dropout
+
+# If you are forking replace this with `import haiku as hk`.
+# pylint: disable=invalid-name
+class hk:
+  Module = module.Module
+  initializers = initializers
+  get_parameter = base.get_parameter
+  PRNGSequence = base.PRNGSequence
+  Linear = basic.Linear
+  dropout = basic.dropout
+# pylint: enable=invalid-name
 del base, basic, module
 
 
@@ -41,12 +42,12 @@ class MLP(hk.Module):
   def __init__(
       self,
       output_sizes: Iterable[int],
-      w_init: Optional[hk.initializers.Initializer] = None,
-      b_init: Optional[hk.initializers.Initializer] = None,
+      w_init: hk.initializers.Initializer | None = None,
+      b_init: hk.initializers.Initializer | None = None,
       with_bias: bool = True,
-      activation: Callable[[jnp.ndarray], jnp.ndarray] = jax.nn.relu,
+      activation: Callable[[jax.Array], jax.Array] = jax.nn.relu,
       activate_final: bool = False,
-      name: Optional[str] = None,
+      name: str | None = None,
   ):
     """Constructs an MLP.
 
@@ -86,10 +87,10 @@ class MLP(hk.Module):
 
   def __call__(
       self,
-      inputs: jnp.ndarray,
-      dropout_rate: Optional[float] = None,
+      inputs: jax.Array,
+      dropout_rate: float | None = None,
       rng=None,
-  ) -> jnp.ndarray:
+  ) -> jax.Array:
     """Connects the module to some inputs.
 
     Args:
@@ -121,8 +122,8 @@ class MLP(hk.Module):
 
   def reverse(
       self,
-      activate_final: Optional[bool] = None,
-      name: Optional[str] = None,
+      activate_final: bool | None = None,
+      name: str | None = None,
   ) -> "MLP":
     """Returns a new MLP which is the layer-wise reverse of this MLP.
 
@@ -135,10 +136,12 @@ class MLP(hk.Module):
     of the parent.
 
     >>> mlp = hk.nets.MLP([1, 2, 3])
-    >>> y = mlp(jnp.ones([1, 2]))
+    >>> mlp_in = jnp.ones([1, 2])
+    >>> y = mlp(mlp_in)
     >>> rev = mlp.reverse()
-    >>> rev(y)
-    DeviceArray(...)
+    >>> rev_mlp_out = rev(y)
+    >>> mlp_in.shape == rev_mlp_out.shape
+    True
 
     Args:
       activate_final: Whether the final layer of the MLP should be activated.
@@ -156,11 +159,19 @@ class MLP(hk.Module):
     if name is None:
       name = self.name + "_reversed"
 
+    output_sizes = tuple(
+        layer.input_size
+        for layer in reversed(self.layers)
+        if layer.input_size is not None
+    )
+    if len(output_sizes) != len(self.layers):
+      raise ValueError("You cannot reverse an MLP until it has been called.")
     return MLP(
-        output_sizes=(layer.input_size for layer in reversed(self.layers)),
+        output_sizes=output_sizes,
         w_init=self.w_init,
         b_init=self.b_init,
         with_bias=self.with_bias,
         activation=self.activation,
         activate_final=activate_final,
-        name=name)
+        name=name,
+    )

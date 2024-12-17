@@ -16,31 +16,34 @@
 
 import collections
 import contextlib
-import sys
 import threading
-import types
-from typing import Dict, Type, Optional, Union
+from typing import TypeVar, Union
 
 from haiku._src import base
 from haiku._src import data_structures
 from haiku._src import module
 import jmp
 
-# If you are forking replace this with `import haiku as hk`.
-hk = types.ModuleType('haiku')
-hk.custom_getter = base.custom_getter
-hk.custom_creator = base.custom_creator
-hk.intercept_methods = module.intercept_methods
-hk.MethodContext = module.MethodContext
-hk.Module = module.Module
-Stack = data_structures.Stack
-del base, data_structures, module
+T = TypeVar('T')
+
+
+# If you are forking replace this block with `import haiku as hk`.
+# pylint: disable=invalid-name
+class hk:
+  custom_getter = base.custom_getter
+  custom_creator = base.custom_creator
+  MethodContext = module.MethodContext
+  Module = module.Module
+# pylint: enable=invalid-name
+# TODO(slebedev): This make the module non-forkable.
+Stack = data_structures.Stack[T]
+del data_structures
 
 ClassInfo = collections.namedtuple('ClassInfo', 'module,qualname')
-ClassInfoOrType = Union[ClassInfo, Type[hk.Module]]
+ClassInfoOrType = Union[ClassInfo, type[hk.Module]]
 
 
-def key_for_module(cls: Type[hk.Module]) -> ClassInfoOrType:
+def key_for_module(cls: type[hk.Module]) -> ClassInfoOrType:
   """Returns a suitable key for the given module class."""
   if '<locals>' in cls.__qualname__:
     # Some APIs (e.g. `hk.to_module`) are factory functions that create modules.
@@ -59,9 +62,9 @@ class _ThreadState(threading.local):
 
   def __init__(self):
     super().__init__()
-    self._interceptor = None
-    self._cls_policy = {}  # type: Dict[ClassInfoOrType, jmp.Policy]
-    self._current_policy = Stack()  # type: Stack[jmp.Policy]
+    self._installed_interceptor = False
+    self._cls_policy: dict[ClassInfoOrType, jmp.Policy] = {}
+    self._current_policy = Stack[jmp.Policy]()
 
   def push_current_policy(self, policy: jmp.Policy):
     return self._current_policy(policy)
@@ -74,46 +77,48 @@ class _ThreadState(threading.local):
   def current_policy(self) -> jmp.Policy:
     return self._current_policy.peek()
 
-  def clear_policy(self, cls: Type[hk.Module]):
+  def clear_policy(self, cls: type[hk.Module]):
     key = key_for_module(cls)
     if key in self._cls_policy:
       del self._cls_policy[key]
 
-  def set_policy(self, cls: Type[hk.Module], policy: jmp.Policy):
-    if self._interceptor is None:
-      self._interceptor = hk.intercept_methods(_mixed_precision_interceptor)
-      self._interceptor.__enter__()
+  def set_policy(self, cls: type[hk.Module], policy: jmp.Policy):
+    if not self._installed_interceptor:
+      module.intercept_methods_global(_mixed_precision_interceptor)
+      self._installed_interceptor = True
     key = key_for_module(cls)
     self._cls_policy[key] = policy
 
-  def get_policy(self, cls: Type[hk.Module]) -> Optional[jmp.Policy]:
+  def get_policy(self, cls: type[hk.Module]) -> jmp.Policy | None:
     key = key_for_module(cls)
     return self._cls_policy.get(key)
 
-  def __del__(self):
-    if self._interceptor is not None:
-      self._interceptor.__exit__(*sys.exc_info())
-      del self._interceptor
 
 _thread_local_state = _ThreadState()
 
 
-def current_policy() -> Optional[jmp.Policy]:
+def reset_thread_local_state_for_test():
+  global _thread_local_state
+  _thread_local_state = _ThreadState()
+
+
+def current_policy() -> jmp.Policy | None:
   """Retrieves the currently active policy in the current context.
 
   Returns:
     The currently active mixed precision policy, or ``None``.
 
   See also:
-    :func:`clear_policy`: Clears any policies associated with a class.
-    :func:`get_policy`: Gets the policy for a given class.
-    :func:`set_policy`: Sets a policy for a given class.
+    - :func:`clear_policy`: Clears any policies associated with a class.
+    - :func:`get_policy`: Gets the policy for a given class.
+    - :func:`set_policy`: Sets a policy for a given class.
+    - :func:`push_policy`: Context manager for setting policies.
   """
   tls = _thread_local_state
   return tls.current_policy if tls.has_current_policy else None
 
 
-def get_policy(cls: Type[hk.Module]) -> Optional[jmp.Policy]:
+def get_policy(cls: type[hk.Module]) -> jmp.Policy | None:
   """Retrieves the currently active policy for the given class.
 
   Note that policies applied explicitly to a top level class (e.g. ``ResNet``)
@@ -128,15 +133,16 @@ def get_policy(cls: Type[hk.Module]) -> Optional[jmp.Policy]:
     A JMP policy that is used for the given class, or ``None`` if one is not
     active.
 
-  See Also:
-    :func:`current_policy`: Retrieves the currently active policy (if any).
-    :func:`clear_policy`: Clears any policies associated with a class.
-    :func:`set_policy`: Sets a policy for a given class.
+  See also:
+    - :func:`current_policy`: Retrieves the currently active policy (if any).
+    - :func:`clear_policy`: Clears any policies associated with a class.
+    - :func:`set_policy`: Sets a policy for a given class.
+    - :func:`push_policy`: Context manager for setting policies.
   """
   return _thread_local_state.get_policy(cls)
 
 
-def set_policy(cls: Type[hk.Module], policy: jmp.Policy):
+def set_policy(cls: type[hk.Module], policy: jmp.Policy):
   """Uses the given policy for all instances of the module class.
 
   NOTE: Policies are only applied to modules created in the current thread.
@@ -156,55 +162,83 @@ def set_policy(cls: Type[hk.Module], policy: jmp.Policy):
   >>> hk.mixed_precision.set_policy(hk.nets.ResNet50, policy)
   >>> net = hk.nets.ResNet50(4)
   >>> x = jnp.ones([4, 224, 224, 3])
-  >>> net(x, is_training=True)
-  DeviceArray([[nan, nan, nan, nan],
-               [nan, nan, nan, nan],
-               [nan, nan, nan, nan],
-               [nan, nan, nan, nan]], dtype=float32)
-
-  Oh no, nan! This is because modules like batch norm are not numerically stable
-  in ``float16``. To address this, we apply a second policy to our batch norm
-  modules to keep them in full precision. We are careful to return a ``float16``
-  output from the module such that subsequent modules receive ``float16`` input:
-
-  >>> policy = jmp.get_policy('params=float32,compute=float32,output=float16')
-  >>> hk.mixed_precision.set_policy(hk.BatchNorm, policy)
-  >>> net(x, is_training=True)
-  DeviceArray([[0., 0., 0., 0.],
-               [0., 0., 0., 0.],
-               [0., 0., 0., 0.],
-               [0., 0., 0., 0.]], dtype=float32)
+  >>> print(net(x, is_training=True))
+  [[0. 0. 0. 0.]
+   [0. 0. 0. 0.]
+   [0. 0. 0. 0.]
+   [0. 0. 0. 0.]]
 
   For a fully worked mixed precision example see the imagenet example in Haiku's
   examples directory. This example shows mixed precision on GPU offering a 2x
   speedup in training time with only a small impact on final top-1 accuracy.
 
   >>> hk.mixed_precision.clear_policy(hk.nets.ResNet50)
-  >>> hk.mixed_precision.clear_policy(hk.BatchNorm)
 
   Args:
     cls: A Haiku module class.
     policy: A JMP policy to apply to the module.
 
-  See Also:
-    :func:`current_policy`: Retrieves the currently active policy (if any).
-    :func:`clear_policy`: Clears any policies associated with a class.
-    :func:`get_policy`: Gets the policy for a given class.
+  See also:
+    - :func:`push_policy`: Context manager for setting policies.
+    - :func:`current_policy`: Retrieves the currently active policy (if any).
+    - :func:`clear_policy`: Clears any policies associated with a class.
+    - :func:`get_policy`: Gets the policy for a given class.
   """
   assert policy is not None, 'To unset policies use clear_policy.'
   _thread_local_state.set_policy(cls, policy)
 
 
-def clear_policy(cls: Type[hk.Module]):
+@contextlib.contextmanager
+def push_policy(cls: type[hk.Module], policy: jmp.Policy):
+  """Sets the given policy for the given class while the context is active.
+
+  Args:
+    cls: A Haiku module class.
+    policy: A JMP policy to apply to the module.
+
+  Yields:
+    ``None``.
+
+  See also:
+    - :func:`clear_policy`: Clears any policies associated with a class.
+    - :func:`get_policy`: Gets the policy for a given class.
+    - :func:`set_policy`: Sets a policy for a given class.
+    - :func:`current_policy`: Retrieves the currently active policy (if any).
+  """
+  assert policy is not None, 'To unset policies use clear_policy.'
+
+  # Check for trying to push a new policy inside a module method. In theory it
+  # is safe to do this when varying the parameter dtype, but we are defensive
+  # and ask users to set policies before calling module methods to avoid
+  # confusion.
+  current_module = base.inside_transform() and base.current_module()
+  if (current_module and
+      key_for_module(type(current_module)) == key_for_module(cls)):
+    raise ValueError(
+        'Pushing a policy inside a method on the same class is not supported.')
+
+  old_policy = get_policy(cls)
+  set_policy(cls, policy)
+  try:
+    yield
+  finally:
+    if old_policy is not None:
+      set_policy(cls, old_policy)
+    else:
+      clear_policy(cls)
+
+
+def clear_policy(cls: type[hk.Module]):
   """Clears any policy assocated with the given class.
 
   Args:
     cls: A Haiku module class.
 
-  See Also:
-    :func:`current_policy`: Retrieves the currently active policy (if any).
-    :func:`get_policy`: Gets the policy for a given class.
-    :func:`set_policy`: Sets a policy for a given class.
+  See also:
+    - :func:`current_policy`: Retrieves the currently active policy (if any).
+    - :func:`get_policy`: Gets the policy for a given class.
+    - :func:`set_policy`: Sets a policy for a given class.
+    - :func:`push_policy`: Context manager for setting policies.
   """
   _thread_local_state.clear_policy(cls)
 

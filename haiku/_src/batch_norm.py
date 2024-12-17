@@ -14,8 +14,7 @@
 # ==============================================================================
 """Batch Norm."""
 
-import types
-from typing import Optional, Sequence
+from collections.abc import Sequence
 
 from haiku._src import base
 from haiku._src import initializers
@@ -26,13 +25,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+
 # If you are forking replace this with `import haiku as hk`.
-hk = types.ModuleType("haiku")
-hk.get_parameter = base.get_parameter
-hk.initializers = initializers
-hk.Module = module.Module
-hk.ExponentialMovingAverage = moving_averages.ExponentialMovingAverage
-hk.get_channel_index = utils.get_channel_index
+# pylint: disable=invalid-name
+class hk:
+  get_parameter = base.get_parameter
+  initializers = initializers
+  Module = module.Module
+  ExponentialMovingAverage = moving_averages.ExponentialMovingAverage
+  get_channel_index = utils.get_channel_index
+# pylint: enable=invalid-name
 del base, initializers, module, moving_averages, utils
 
 
@@ -65,13 +67,13 @@ class BatchNorm(hk.Module):
       create_offset: bool,
       decay_rate: float,
       eps: float = 1e-5,
-      scale_init: Optional[hk.initializers.Initializer] = None,
-      offset_init: Optional[hk.initializers.Initializer] = None,
-      axis: Optional[Sequence[int]] = None,
-      cross_replica_axis: Optional[str] = None,
-      cross_replica_axis_index_groups: Optional[Sequence[Sequence[int]]] = None,
+      scale_init: hk.initializers.Initializer | None = None,
+      offset_init: hk.initializers.Initializer | None = None,
+      axis: Sequence[int] | None = None,
+      cross_replica_axis: str | Sequence[str] | None = None,
+      cross_replica_axis_index_groups: Sequence[Sequence[int]] | None = None,
       data_format: str = "channels_last",
-      name: Optional[str] = None,
+      name: str | None = None,
   ):
     """Constructs a BatchNorm module.
 
@@ -88,11 +90,13 @@ class BatchNorm(hk.Module):
       axis: Which axes to reduce over. The default (``None``) signifies that all
         but the channel axis should be normalized. Otherwise this is a list of
         axis indices which will have normalization statistics calculated.
-      cross_replica_axis: If not ``None``, it should be a string representing
-        the axis name over which this module is being run within a ``jax.pmap``.
-        Supplying this argument means that batch statistics are calculated
-        across all replicas on that axis.
-      cross_replica_axis_index_groups: Specifies how devices are grouped.
+      cross_replica_axis: If not ``None``, it should be a string (or sequence of
+        strings) representing the axis name(s) over which this module is being
+        run within a jax map (e.g. ``jax.pmap`` or ``jax.vmap``). Supplying this
+        argument means that batch statistics are calculated across all replicas
+        on the named axes.
+      cross_replica_axis_index_groups: Specifies how devices are grouped. Valid
+        only within ``jax.pmap`` collectives.
       data_format: The data format of the input. Can be either
         ``channels_first``, ``channels_last``, ``N...C`` or ``NC...``. By
         default it is ``channels_last``. See :func:`get_channel_index`.
@@ -122,12 +126,12 @@ class BatchNorm(hk.Module):
 
   def __call__(
       self,
-      inputs: jnp.ndarray,
+      inputs: jax.Array,
       is_training: bool,
       test_local_stats: bool = False,
-      scale: Optional[jnp.ndarray] = None,
-      offset: Optional[jnp.ndarray] = None,
-  ) -> jnp.ndarray:
+      scale: jax.Array | None = None,
+      offset: jax.Array | None = None,
+  ) -> jax.Array:
     """Computes the normalized version of the input.
 
     Args:
@@ -176,8 +180,8 @@ class BatchNorm(hk.Module):
             axis_index_groups=self.cross_replica_axis_index_groups)
       var = mean_of_squares - jnp.square(mean)
     else:
-      mean = self.mean_ema.average
-      var = self.var_ema.average
+      mean = self.mean_ema.average.astype(inputs.dtype)
+      var = self.var_ema.average.astype(inputs.dtype)
 
     if is_training:
       self.mean_ema(mean)

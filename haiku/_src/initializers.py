@@ -14,8 +14,8 @@
 # ==============================================================================
 """Haiku initializers."""
 
-import types
-from typing import Any, Sequence, Union
+from collections.abc import Sequence
+from typing import Any
 
 from haiku._src import base
 from haiku._src.typing import Initializer
@@ -23,15 +23,19 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-# If forking replace this block with `import haiku as hk`.
-hk = types.ModuleType('haiku')
-hk.next_rng_key = base.next_rng_key
-hk.initializers = types.ModuleType('haiku.initializers')
-hk.initializers.Initializer = Initializer
+
+# If you are forking replace this block with `import haiku as hk`.
+# pylint: disable=invalid-name
+class hk:
+  next_rng_key = base.next_rng_key
+
+  class initializers:
+    Initializer = Initializer
+# pylint: enable=invalid-name
 del base
 
 
-def _compute_fans(shape):
+def _compute_fans(shape, fan_in_axes=None):
   """Computes the number of input and output units for a weight shape."""
   if len(shape) < 1:
     fan_in = fan_out = 1
@@ -40,18 +44,26 @@ def _compute_fans(shape):
   elif len(shape) == 2:
     fan_in, fan_out = shape
   else:
-    # Assuming convolution kernels (2D, 3D, or more.)
-    # kernel_shape: (..., input_depth, depth)
-    receptive_field_size = np.prod(shape[:-2])
-    fan_in = shape[-2] * receptive_field_size
-    fan_out = shape[-1] * receptive_field_size
+    if fan_in_axes is not None:
+      # Compute fan-in using user-specified fan-in axes.
+      fan_in = np.prod([shape[i] for i in fan_in_axes])
+      fan_out = np.prod([s for i, s in enumerate(shape)
+                         if i not in fan_in_axes])
+    else:
+      # If no axes specified, assume convolution kernels (2D, 3D, or more.)
+      # kernel_shape: (..., input_depth, depth)
+      receptive_field_size = np.prod(shape[:-2])
+      fan_in = shape[-2] * receptive_field_size
+      fan_out = shape[-1] * receptive_field_size
   return fan_in, fan_out
 
 
 class Constant(hk.initializers.Initializer):
   """Initializes with a constant."""
 
-  def __init__(self, constant: Union[float, int, jnp.ndarray]):
+  def __init__(
+      self, constant: float | int | complex | np.ndarray | jax.Array
+  ):
     """Constructs a Constant initializer.
 
     Args:
@@ -59,8 +71,8 @@ class Constant(hk.initializers.Initializer):
     """
     self.constant = constant
 
-  def __call__(self, shape: Sequence[int], dtype: Any) -> jnp.ndarray:
-    return jnp.broadcast_to(self.constant, shape).astype(dtype)
+  def __call__(self, shape: Sequence[int], dtype: Any) -> jax.Array:
+    return jnp.broadcast_to(jnp.asarray(self.constant), shape).astype(dtype)
 
 
 class RandomNormal(hk.initializers.Initializer):
@@ -76,7 +88,7 @@ class RandomNormal(hk.initializers.Initializer):
     self.stddev = stddev
     self.mean = mean
 
-  def __call__(self, shape: Sequence[int], dtype) -> jnp.ndarray:
+  def __call__(self, shape: Sequence[int], dtype) -> jax.Array:
     m = jax.lax.convert_element_type(self.mean, dtype)
     s = jax.lax.convert_element_type(self.stddev, dtype)
     return m + s * jax.random.normal(hk.next_rng_key(), shape, dtype)
@@ -86,27 +98,34 @@ class TruncatedNormal(hk.initializers.Initializer):
   """Initializes by sampling from a truncated normal distribution."""
 
   def __init__(self,
-               stddev: Union[float, jnp.ndarray] = 1.,
-               mean: Union[float, jnp.ndarray] = 0.):
+               stddev: float | jax.Array = 1.,
+               mean: float | complex | jax.Array = 0.0,
+               lower: float | jax.Array = -2.0,
+               upper: float | jax.Array = 2.0,
+               ):
     """Constructs a :class:`TruncatedNormal` initializer.
 
     Args:
-      stddev: The standard deviation parameter of the truncated
-        normal distribution.
+      stddev: The standard deviation parameter of the untruncated normal
+        distribution.
       mean: The mean of the truncated normal distribution.
+      lower: Float or array representing the lower bound for truncation.
+      upper: Float or array representing the upper bound for truncation.
     """
     self.stddev = stddev
     self.mean = mean
+    self.lower = lower
+    self.upper = upper
 
-  def __call__(self, shape: Sequence[int], dtype: Any) -> jnp.ndarray:
+  def __call__(self, shape: Sequence[int], dtype: Any) -> jax.Array:
     real_dtype = jnp.finfo(dtype).dtype
     m = jax.lax.convert_element_type(self.mean, dtype)
     s = jax.lax.convert_element_type(self.stddev, real_dtype)
     is_complex = jnp.issubdtype(dtype, jnp.complexfloating)
     if is_complex:
       shape = [2, *shape]
-    unscaled = jax.random.truncated_normal(hk.next_rng_key(), -2., 2., shape,
-                                           real_dtype)
+    unscaled = jax.random.truncated_normal(
+        hk.next_rng_key(), self.lower, self.upper, shape, real_dtype)
     if is_complex:
       unscaled = unscaled[0] + 1j * unscaled[1]
     return s * unscaled + m
@@ -125,7 +144,7 @@ class RandomUniform(hk.initializers.Initializer):
     self.minval = minval
     self.maxval = maxval
 
-  def __call__(self, shape: Sequence[int], dtype: Any) -> jnp.ndarray:
+  def __call__(self, shape: Sequence[int], dtype: Any) -> jax.Array:
     return jax.random.uniform(hk.next_rng_key(), shape, dtype, self.minval,
                               self.maxval)
 
@@ -163,7 +182,8 @@ class VarianceScaling(hk.initializers.Initializer):
   ==============  ==============================================================
   """
 
-  def __init__(self, scale=1.0, mode='fan_in', distribution='truncated_normal'):
+  def __init__(self, scale=1.0, mode='fan_in', distribution='truncated_normal',
+               fan_in_axes=None):
     """Constructs the :class:`VarianceScaling` initializer.
 
     Args:
@@ -171,6 +191,11 @@ class VarianceScaling(hk.initializers.Initializer):
       mode: One of ``fan_in``, ``fan_out``, ``fan_avg``
       distribution: Random distribution to use. One of ``truncated_normal``,
         ``normal`` or ``uniform``.
+      fan_in_axes: Optional sequence of int specifying which axes of the shape
+        are part of the fan-in. If none provided, then the weight is assumed
+        to be like a convolution kernel, where all leading dimensions are part
+        of the fan-in, and only the trailing dimension is part of the fan-out.
+        Useful if instantiating multi-headed attention weights.
     """
     if scale < 0.0:
       raise ValueError('`scale` must be a positive float.')
@@ -182,10 +207,11 @@ class VarianceScaling(hk.initializers.Initializer):
     self.scale = scale
     self.mode = mode
     self.distribution = distribution
+    self.fan_in_axes = fan_in_axes
 
-  def __call__(self, shape: Sequence[int], dtype: Any) -> jnp.ndarray:
+  def __call__(self, shape: Sequence[int], dtype: Any) -> jax.Array:
     scale = self.scale
-    fan_in, fan_out = _compute_fans(shape)
+    fan_in, fan_out = _compute_fans(shape, self.fan_in_axes)
     if self.mode == 'fan_in':
       scale /= max(1.0, fan_in)
     elif self.mode == 'fan_out':
@@ -224,8 +250,8 @@ class UniformScaling(hk.initializers.Initializer):
     """
     self.scale = scale
 
-  def __call__(self, shape: Sequence[int], dtype: Any) -> jnp.ndarray:
-    input_size = np.product(shape[:-1])
+  def __call__(self, shape: Sequence[int], dtype: Any) -> jax.Array:
+    input_size = np.prod(shape[:-1])
     max_val = np.sqrt(3 / input_size) * self.scale
     return RandomUniform(-max_val, max_val)(shape, dtype)
 
@@ -256,7 +282,7 @@ class Orthogonal(hk.initializers.Initializer):
     self.scale = scale
     self.axis = axis
 
-  def __call__(self, shape: Sequence[int], dtype: Any) -> jnp.ndarray:
+  def __call__(self, shape: Sequence[int], dtype: Any) -> jax.Array:
     if len(shape) < 2:
       raise ValueError('Orthogonal initializer requires at least a 2D shape.')
     n_rows = shape[self.axis]
@@ -273,13 +299,13 @@ class Orthogonal(hk.initializers.Initializer):
     return jax.lax.convert_element_type(self.scale, dtype) * q_mat
 
 
-class Identity(Initializer):
+class Identity(hk.initializers.Initializer):
   """Initializer that generates the identity matrix.
 
   Constructs a 2D identity matrix or batches of these.
   """
 
-  def __init__(self, gain: Union[float, jnp.ndarray] = 1.0):
+  def __init__(self, gain: float | np.ndarray | jax.Array = 1.0):
     """Constructs an :class:`Identity` initializer.
 
     Args:
@@ -287,7 +313,7 @@ class Identity(Initializer):
     """
     self.gain = gain
 
-  def __call__(self, shape: Sequence[int], dtype: Any) -> jnp.ndarray:
+  def __call__(self, shape: Sequence[int], dtype: Any) -> jax.Array:
     shape = tuple(shape)
     if len(shape) < 2:
       raise ValueError('Identity initializer requires at least a 2D shape.')

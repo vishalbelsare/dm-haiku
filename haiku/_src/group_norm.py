@@ -15,8 +15,7 @@
 """Group normalization implementation for Haiku."""
 
 import collections
-import types
-from typing import Optional, Sequence, Union
+from collections.abc import Sequence
 
 from haiku._src import base
 from haiku._src import initializers
@@ -25,12 +24,15 @@ from haiku._src import utils
 import jax
 import jax.numpy as jnp
 
-# If you are forking replace this with `import haiku as hk`.
-hk = types.ModuleType("haiku")
-hk.get_parameter = base.get_parameter
-hk.initializers = initializers
-hk.Module = module.Module
-hk.get_channel_index = utils.get_channel_index
+
+# If you are forking replace this block with `import haiku as hk`.
+# pylint: disable=invalid-name
+class hk:
+  get_parameter = base.get_parameter
+  initializers = initializers
+  Module = module.Module
+  get_channel_index = utils.get_channel_index
+# pylint: enable=invalid-name
 del base, initializers, module, utils
 
 
@@ -70,14 +72,14 @@ class GroupNorm(hk.Module):
   def __init__(
       self,
       groups: int,
-      axis: Union[int, slice, Sequence[int]] = slice(1, None),
+      axis: int | slice | Sequence[int] = slice(1, None),
       create_scale: bool = True,
       create_offset: bool = True,
       eps: float = 1e-5,
-      scale_init: Optional[hk.initializers.Initializer] = None,
-      offset_init: Optional[hk.initializers.Initializer] = None,
+      scale_init: hk.initializers.Initializer | None = None,
+      offset_init: hk.initializers.Initializer | None = None,
       data_format: str = "channels_last",
-      name: Optional[str] = None,
+      name: str | None = None,
   ):
     """Constructs a ``GroupNorm`` module.
 
@@ -140,10 +142,10 @@ class GroupNorm(hk.Module):
 
   def __call__(
       self,
-      x: jnp.ndarray,
-      scale: Optional[jnp.ndarray] = None,
-      offset: Optional[jnp.ndarray] = None,
-  ) -> jnp.ndarray:
+      x: jax.Array,
+      scale: jax.Array | None = None,
+      offset: jax.Array | None = None,
+  ) -> jax.Array:
     """Returns normalized inputs.
 
     Args:
@@ -214,7 +216,7 @@ class GroupNorm(hk.Module):
 
     return x
 
-  def _initialize(self, x: jnp.ndarray, channels: int):
+  def _initialize(self, x: jax.Array, channels: int):
     assert self.rank is None
     self.rank = x.ndim
 

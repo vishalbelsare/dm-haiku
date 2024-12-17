@@ -15,10 +15,12 @@
 """Functions for filtering parameters and state in Haiku."""
 
 import collections
-from typing import Any, Callable, Generator, Mapping, Tuple, TypeVar
+from collections.abc import Callable, Generator, Mapping, MutableMapping
+from typing import Any, TypeVar
 
 from haiku._src import data_structures
-import jax.numpy as jnp
+from haiku._src import utils
+import jax
 
 T = TypeVar("T")
 InT = TypeVar("InT")
@@ -27,7 +29,7 @@ OutT = TypeVar("OutT")
 
 def traverse(
     structure: Mapping[str, Mapping[str, T]],
-) -> Generator[Tuple[str, str, T], None, None]:
+) -> Generator[tuple[str, str, T], None, None]:
   """Iterates over a structure yielding module names, names and values.
 
   NOTE: Items are iterated in key sorted order.
@@ -46,9 +48,9 @@ def traverse(
 
 
 def partition(
-    predicate: Callable[[str, str, jnp.ndarray], bool],
+    predicate: Callable[[str, str, jax.Array], bool],
     structure: Mapping[str, Mapping[str, T]],
-) -> Tuple[Mapping[str, Mapping[str, T]], Mapping[str, Mapping[str, T]]]:
+) -> tuple[Mapping[str, Mapping[str, T]], Mapping[str, Mapping[str, T]]]:
   """Partitions the input structure in two according to a given predicate.
 
   For a given set of parameters, you can use :func:`partition` to split them:
@@ -83,7 +85,7 @@ def partition_n(
     fn: Callable[[str, str, T], int],
     structure: Mapping[str, Mapping[str, T]],
     n: int,
-) -> Tuple[Mapping[str, Mapping[str, T]], ...]:
+) -> tuple[Mapping[str, Mapping[str, T]], ...]:
   """Partitions a structure into `n` structures.
 
   For a given set of parameters, you can use :func:`partition_n` to split them
@@ -168,9 +170,10 @@ def map(  # pylint: disable=redefined-builtin
 
   Args:
     fn: criterion to be used to map the input data.
-      The ``fn`` argument is expected to be a boolean function taking as
-      inputs the name of the module, the name of a given entry in the module
-      data bundle (e.g. parameter name) and the corresponding data.
+      The ``fn`` argument is expected to be a function taking as inputs the
+      name of the module, the name of a given entry in the module data bundle
+      (e.g. parameter name) and the corresponding data, and returning a new
+      value.
     structure: Haiku params or state data structure to be mapped.
 
   Returns:
@@ -183,8 +186,9 @@ def map(  # pylint: disable=redefined-builtin
 
 
 def merge(
-    *structures: Mapping[str, Mapping[str, Any]]
-) -> Mapping[str, Mapping[str, Any]]:
+    *structures: Mapping[str, Mapping[str, Any]],
+    check_duplicates: bool = False,
+) -> MutableMapping[str, MutableMapping[str, Any]]:
   """Merges multiple input structures.
 
   >>> weights = {'linear': {'w': None}}
@@ -204,13 +208,25 @@ def merge(
 
   Args:
     *structures: One or more structures to merge.
+    check_duplicates: If True, a ValueError will be thrown if an array is
+      found in multiple structures but with a different shape and dtype.
 
   Returns:
     A single structure with an entry for each path in the input structures.
   """
+  array_like = lambda o: hasattr(o, "shape") and hasattr(o, "dtype")
+  shaped = lambda a: (a.shape, a.dtype) if array_like(a) else None
+  fmt = lambda a: utils.format_array(a) if array_like(a) else repr(a)
+
   out = collections.defaultdict(dict)
   for structure in structures:
     for module_name, name, value in traverse(structure):
+      if check_duplicates and (name in out[module_name]):
+        previous = out[module_name][name]
+        if shaped(previous) != shaped(value):
+          raise ValueError(
+              "Duplicate array found with different shape/dtype for "
+              f"{module_name}.{name}: {fmt(previous)} vs {fmt(value)}.")
       out[module_name][name] = value
   return data_structures.to_haiku_dict(out)
 
@@ -236,6 +252,6 @@ def is_subset(
     A boolean indicating whether all elements in subset are contained in
     superset.
   """
-  subset = set((m, n) for m, n, _ in traverse(subset))
-  superset = set((m, n) for m, n, _ in traverse(superset))
+  subset = {(m, n) for m, n, _ in traverse(subset)}
+  superset = {(m, n) for m, n, _ in traverse(superset)}
   return subset.issubset(superset)

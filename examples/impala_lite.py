@@ -20,10 +20,11 @@ For a more full-fledged implementation, see examples/impala/README.md.
 See: https://arxiv.org/abs/1802.01561
 """
 
+from collections.abc import Callable
 import functools
 import queue
 import threading
-from typing import Any, Callable, NamedTuple, Tuple
+from typing import Any, NamedTuple
 
 from absl import app
 from absl import logging
@@ -53,7 +54,7 @@ class SimpleNet(hk.Module):
   def __call__(
       self,
       timestep: dm_env.TimeStep,
-  ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+  ) -> tuple[jax.Array, jax.Array]:
     """Process a batch of observations."""
     torso = hk.Sequential([hk.Flatten(),
                            hk.Linear(128), jax.nn.relu,
@@ -76,21 +77,21 @@ class Agent:
   def step(
       self,
       params: hk.Params,
-      rng: jnp.ndarray,
+      rng: jax.Array,
       timestep: dm_env.TimeStep,
-  ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+  ) -> tuple[jax.Array, jax.Array]:
     """Steps on a single observation."""
-    timestep = jax.tree_map(lambda t: jnp.expand_dims(t, 0), timestep)
+    timestep = jax.tree.map(lambda t: jnp.expand_dims(t, 0), timestep)
     logits, _ = self._net(params, timestep)
     logits = jnp.squeeze(logits, axis=0)
     action = hk.multinomial(rng, logits, num_samples=1)
     action = jnp.squeeze(action, axis=-1)
     return action, logits
 
-  def loss(self, params: hk.Params, trajs: Transition) -> jnp.ndarray:
+  def loss(self, params: hk.Params, trajs: Transition) -> jax.Array:
     """Computes a loss of trajs wrt params."""
     # Re-run the agent over the trajectories.
-    # Due to https://github.com/google/jax/issues/1459, we use hk.BatchApply
+    # Due to https://github.com/jax-ml/jax/issues/1459, we use hk.BatchApply
     # instead of vmap.
     # BatchApply turns the input tensors from [T, B, ...] into [T*B, ...].
     # We `functools.partial` params in so it does not get transformed.
@@ -102,12 +103,12 @@ class Agent:
     baseline_tp1 = baseline_with_bootstrap[1:]
 
     # Remove bootstrap timestep from non-observations.
-    _, actions, behavior_logits = jax.tree_map(lambda t: t[:-1], trajs)
+    _, actions, behavior_logits = jax.tree.map(lambda t: t[:-1], trajs)
     learner_logits = learner_logits[:-1]
 
     # Shift step_type/reward/discount back by one, so that actions match the
     # timesteps caused by the action.
-    timestep = jax.tree_map(lambda t: t[1:], trajs.timestep)
+    timestep = jax.tree.map(lambda t: t[1:], trajs.timestep)
     discount = timestep.discount * self._discount
     # The step is uninteresting if we transitioned LAST -> FIRST.
     mask = jnp.not_equal(timestep.step_type, int(dm_env.StepType.FIRST))
@@ -148,12 +149,12 @@ def preprocess_step(ts: dm_env.TimeStep) -> dm_env.TimeStep:
     ts = ts._replace(reward=0.)
   if ts.discount is None:
     ts = ts._replace(discount=1.)
-  return jax.tree_map(np.asarray, ts)
+  return jax.tree.map(np.asarray, ts)
 
 
 def run_actor(
     agent: Agent,
-    rng_key: jnp.ndarray,
+    rng_key: jax.Array,
     get_params: Callable[[], hk.Params],
     enqueue_traj: Callable[[Transition], None],
     unroll_len: int,
@@ -179,7 +180,7 @@ def run_actor(
                             state.reward)
 
     # Stack and send the trajectory.
-    stacked_traj = jax.tree_multimap(lambda *ts: np.stack(ts), *traj)
+    stacked_traj = jax.tree.map(lambda *ts: np.stack(ts), *traj)
     enqueue_traj(stacked_traj)
     # Reset the trajectory, keeping the last timestep.
     traj = traj[-1:]
@@ -198,7 +199,7 @@ class Learner:
       params: hk.Params,
       opt_state: optax.OptState,
       trajs: Transition,
-  ) -> Tuple[hk.Params, optax.OptState]:
+  ) -> tuple[hk.Params, optax.OptState]:
     g = jax.grad(self._agent.loss)(params, trajs)
     updates, new_opt_state = self._opt_update(g, opt_state)
     return optax.apply_updates(params, updates), new_opt_state
@@ -221,7 +222,7 @@ def run(*, trajectories_per_actor, num_actors, unroll_len):
   # Initialize the optimizer state.
   sample_ts = env.reset()
   sample_ts = preprocess_step(sample_ts)
-  ts_with_batch = jax.tree_map(lambda t: np.expand_dims(t, 0), sample_ts)
+  ts_with_batch = jax.tree.map(lambda t: np.expand_dims(t, 0), sample_ts)
   params = jax.jit(net.init)(jax.random.PRNGKey(428), ts_with_batch)
   opt_state = opt.init(params)
 
@@ -234,7 +235,7 @@ def run(*, trajectories_per_actor, num_actors, unroll_len):
     batch = []
     for _ in range(batch_size):
       batch.append(q.get())
-    batch = jax.tree_multimap(lambda *ts: np.stack(ts, axis=1), *batch)
+    batch = jax.tree.map(lambda *ts: np.stack(ts, axis=1), *batch)
     return jax.device_put(batch)
 
   # Start the actors.

@@ -32,7 +32,7 @@ def init_benchmark(model):
     k = jax.random.PRNGKey(42)
 
     while state:
-      jax.xla_computation(init)(k, x)
+      jax.jit(init).lower(k, x).compiler_ir(dialect='hlo')
 
   @google_benchmark.register(name=f'compile_{model.__name__}')
   def compile_bench(state):
@@ -40,11 +40,10 @@ def init_benchmark(model):
     x = jnp.ones(input_shape).block_until_ready()
     k = jax.random.PRNGKey(42)
 
-    c = jax.xla_computation(init)(k, x)
-    b = jax.lib.xla_bridge.get_backend()
+    c = jax.jit(init).lower(k, x)
 
     while state:
-      b.compile(c)
+      c.compile()
 
   @google_benchmark.register(name=f'run_{model.__name__}')
   def run_bench(state):
@@ -59,7 +58,7 @@ def init_benchmark(model):
     while state:
       params, _ = jitted_init(k, x)
       # block on computation to finish
-      jax.tree_map(lambda x: x.block_until_ready(), params)
+      jax.tree.map(lambda x: x.block_until_ready(), params)
 
   return trace_bench, compile_bench, run_bench
 

@@ -14,8 +14,9 @@
 # ==============================================================================
 """Base Haiku module."""
 
-import types
-from typing import Any, Callable, Mapping, NamedTuple, Optional, Tuple, TypeVar, Union
+from collections.abc import Callable, Mapping
+import inspect
+from typing import Any, NamedTuple, Optional, TypeVar, Union
 
 from haiku._src import analytics
 from haiku._src import base
@@ -23,11 +24,17 @@ from haiku._src import data_structures
 from haiku._src import typing
 import jax
 
+
 # If you are forking replace this with `import haiku as hk`.
-hk = types.ModuleType("haiku")
-hk.PRNGSequence = base.PRNGSequence
-hk.Params = typing.Params
-hk.State = typing.State
+# pylint: disable=invalid-name
+class hk:
+  PRNGSequence = base.PRNGSequence
+  Params = typing.Params
+  State = typing.State
+  MutableParams = typing.MutableParams
+  MutableState = typing.MutableState
+# pylint: enable=invalid-name
+# TODO(slebedev): This makes the module non-forkable.
 PRNGKey = typing.PRNGKey
 del typing
 
@@ -35,6 +42,52 @@ T = TypeVar("T")
 
 # TODO(b/161684853): Use protocols for transform if/when PEP-612 is implemented.
 # https://www.python.org/dev/peps/pep-0612/
+
+
+def sig_replace_leading_parameters(
+    s: inspect.Signature, n: int, new_params: list[inspect.Parameter]
+) -> inspect.Signature:
+  """Replace the first n positional parameters of a signature."""
+  p = list(s.parameters.values())
+  for i in range(n):
+    if i >= len(p) or p[i].kind not in {
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD
+    }:
+      break  # not enough arguments (or args in VARARGS that can't be counted)
+  else:
+    i = n
+  return inspect.Signature(
+      parameters=new_params + p[i:], return_annotation=s.return_annotation,
+      __validate_parameters__=False)
+
+
+def sig_remove_state(s: inspect.Signature) -> inspect.Signature:
+  """Remove hk.State from the return type of a signature."""
+  ret = s.return_annotation
+  # Extract the tuple element types from `typing._GenericAlias` or
+  # `types.GenericAlias`.
+  ret_generic = getattr(ret, "__origin__", None)
+  ret_type_args = getattr(ret, "__args__", ())
+  if ret_generic is tuple and len(ret_type_args) == 2:
+    ret = ret_type_args[0]
+  else:
+    ret = Any
+  return inspect.Signature(
+      parameters=list(s.parameters.values()), return_annotation=ret,
+      __validate_parameters__=False)
+
+
+def sig_add_state(s: inspect.Signature) -> inspect.Signature:
+  """Add hk.State to the return type of a signature."""
+  if s.return_annotation is inspect.Parameter.empty:
+    ret = Any
+  else:
+    ret = s.return_annotation
+  return inspect.Signature(
+      parameters=list(s.parameters.values()),
+      return_annotation=tuple[ret, hk.State],
+      __validate_parameters__=False)
 
 
 class Transformed(NamedTuple):
@@ -46,7 +99,7 @@ class Transformed(NamedTuple):
   """
 
   # Args: [Optional[PRNGKey], ...]
-  init: Callable[..., hk.Params]
+  init: Callable[..., hk.MutableParams]
 
   # Args: [Params, Optional[PRNGKey], ...]
   apply: Callable[..., Any]
@@ -61,24 +114,24 @@ class TransformedWithState(NamedTuple):
   """
 
   # Args: [Optional[PRNGKey], ...]
-  init: Callable[..., Tuple[hk.Params, hk.State]]
+  init: Callable[..., tuple[hk.MutableParams, hk.MutableState]]
 
   # Args: [hk.Params, hk.State, Optional[PRNGKey], ...]
-  apply: Callable[..., Tuple[Any, hk.State]]
+  apply: Callable[..., tuple[Any, hk.MutableState]]
 
 
-def to_prng_sequence(rng, err_msg) -> Optional[hk.PRNGSequence]:
+def to_prng_sequence(rng, err_msg) -> hk.PRNGSequence | None:
   if rng is not None:
     try:
       rng = hk.PRNGSequence(rng)
     except Exception as e:
-      raise ValueError(err_msg) from e
+      raise ValueError(
+          f"{err_msg}. The object was of type {type(rng)}: {rng}") from e
   return rng
 
-RNG_ERROR_TPL = (
-    "{f} must be called with an RNG as the {position} argument, "
-    "the required signature is: `{signature}`"
-)
+
+RNG_ERROR_TPL = ("{f} must be called with an RNG as the {position} argument, "
+                 "the required signature is: `{signature}`")
 INIT_RNG_ERROR = RNG_ERROR_TPL.format(
     f="Init", position="first", signature="init(rng, *a, **k)")
 APPLY_RNG_ERROR = RNG_ERROR_TPL.format(
@@ -99,8 +152,8 @@ def without_state(f: TransformedWithState) -> Transformed:
   >>> rng = jax.random.PRNGKey(42)
   >>> x = jnp.zeros([1, 1])
   >>> params = f.init(rng, x)
-  >>> f.apply(params, rng, x)
-  DeviceArray([[0., 0., 0., 0., 0., 0., 0., 0., 0., 0.]], dtype=float32)
+  >>> print(f.apply(params, rng, x))
+  [[0. 0. 0. 0. 0. 0. 0. 0. 0. 0.]]
 
   Args:
     f: A transformed function.
@@ -109,12 +162,15 @@ def without_state(f: TransformedWithState) -> Transformed:
     A transformed function that does not take or return state.
   """
 
-  def init_fn(*args, **kwargs):
+  def init_fn(*args, **kwargs) -> hk.MutableParams:
     params, state = f.init(*args, **kwargs)
     if state:
-      raise ValueError("If your transformed function uses `hk.{get,set}_state` "
-                       "then use `hk.transform_with_state`.")
+      raise base.NonEmptyStateError(
+          "If your transformed function uses `hk.{get,set}_state` then use "
+          "`hk.transform_with_state`.")
     return params
+
+  init_fn.__signature__ = sig_remove_state(inspect.signature(f.init))
 
   def apply_fn(params, *args, **kwargs):
     if "state" in kwargs:
@@ -124,11 +180,21 @@ def without_state(f: TransformedWithState) -> Transformed:
           "pass them positionally (e.g. `f.apply(.., my_state)` and not by "
           "name (e.g. `f.apply(.., state=my_state)`)")
 
-    out, state = f.apply(params, {}, *args, **kwargs)
+    out, state = f.apply(params, None, *args, **kwargs)
     if state:
-      raise ValueError("If your transformed function uses `hk.{get,set}_state` "
-                       "then use `hk.transform_with_state`.")
+      raise base.NonEmptyStateError(
+          "If your transformed function uses `hk.{get,set}_state` then use "
+          "`hk.transform_with_state`.")
     return out
+
+  apply_fn.__signature__ = sig_remove_state(
+      sig_replace_leading_parameters(
+          inspect.signature(f.apply), 2, [
+              inspect.Parameter(
+                  "params",
+                  inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                  annotation=Optional[hk.Params])
+          ]))
 
   tie_in_original_fn(f, init_fn, apply_fn)
 
@@ -150,8 +216,8 @@ def with_empty_state(f: Transformed) -> TransformedWithState:
   >>> state
   {}
   >>> out, state = f.apply(params, state, rng, x)
-  >>> out
-  DeviceArray([[0., 0., 0., 0., 0., 0., 0., 0., 0., 0.]], dtype=float32)
+  >>> print(out)
+  [[0. 0. 0. 0. 0. 0. 0. 0. 0. 0.]]
   >>> state
   {}
 
@@ -162,66 +228,36 @@ def with_empty_state(f: Transformed) -> TransformedWithState:
     A transformed function that does accepts and returns state.
   """
 
-  def init_fn(*args, **kwargs):
+  def init_fn(*args, **kwargs) -> tuple[hk.MutableParams, hk.MutableState]:
     params = f.init(*args, **kwargs)
     state = data_structures.to_haiku_dict({})
     return params, state
 
-  def apply_fn(params, state, *args, **kwargs):
+  init_fn.__signature__ = sig_add_state(inspect.signature(f.init))
+
+  def apply_fn(
+      params: hk.Params, state: hk.State | None, *args, **kwargs
+  ) -> tuple[Any, hk.MutableState]:
     del state
     out = f.apply(params, *args, **kwargs)
     state = data_structures.to_haiku_dict({})
     return out, state
 
+  apply_fn.__signature__ = sig_add_state(sig_replace_leading_parameters(
+      inspect.signature(f.apply), 1, [
+          inspect.Parameter(
+              "param",
+              inspect.Parameter.POSITIONAL_OR_KEYWORD,
+              annotation=hk.Params),
+          inspect.Parameter(
+              "state",
+              inspect.Parameter.POSITIONAL_OR_KEYWORD,
+              annotation=hk.Params)
+      ]))
+
   tie_in_original_fn(f, init_fn, apply_fn)
 
   return TransformedWithState(init=init_fn, apply=apply_fn)
-
-
-TransformedT = TypeVar("TransformedT", Transformed, TransformedWithState)
-
-
-def without_apply_rng(f: TransformedT) -> TransformedT:
-  """Removes the rng argument from the apply function.
-
-  This is a convenience wrapper that makes the ``rng`` argument to
-  ``f.apply`` default to ``None``. This is useful when ``f`` doesn't actually
-  use random numbers as part of its computation, such that the ``rng`` argument
-  wouldn't be used. Note that if ``f`` `does` use random numbers, this will
-  cause an error to be thrown complaining that ``f`` needs a non-None PRNGKey.
-
-  Args:
-    f: A transformed function.
-
-  Returns:
-    The same transformed function, with a modified ``apply``.
-  """
-  def check_rng_kwarg(kwargs):
-    if "rng" in kwargs:
-      raise TypeError(
-          "Haiku transform adds three arguments (params, state, rng) to apply. "
-          "If the functions you are transforming use the same names you must "
-          "pass them positionally (e.g. `f.apply(.., my_rng)` and not by "
-          "name (e.g. `f.apply(.., rng=my_rng)`)")
-
-  if isinstance(f, TransformedWithState):
-    def apply_fn(params, state, *args, **kwargs):
-      check_rng_kwarg(kwargs)
-      return f.apply(params, state, None, *args, **kwargs)
-    f_new = TransformedWithState(init=f.init, apply=apply_fn)
-
-  elif isinstance(f, Transformed):
-    def apply_fn(params, *args, **kwargs):
-      check_rng_kwarg(kwargs)
-      return f.apply(params, None, *args, **kwargs)
-    f_new = Transformed(init=f.init, apply=apply_fn)
-
-  else:
-    raise ValueError("Must be called with the result of `hk.transformed` or "
-                     f"`hk.transformed_with_state`, actual {type(f)}")
-
-  tie_in_original_fn(f, f_new.init, f_new.apply)
-  return f_new
 
 
 # TODO(tomhennigan) Remove apply_rng.
@@ -261,15 +297,15 @@ def transform(f, *, apply_rng=True) -> Transformed:
 
   >>> params = f.init(None, 1)
   >>> params
-  {'my_module': {'w': DeviceArray(0., dtype=float32)},
-   'my_module_1': {'w': DeviceArray(0., dtype=float32)}}
+  {'my_module': {'w': ...Array(0., dtype=float32)},
+   'my_module_1': {'w': ...Array(0., dtype=float32)}}
 
   You can then apply the function with the given parameters by calling
   ``apply`` (note that since we don't use Haiku's random number APIs to apply
   our network we pass ``None`` as an RNG key):
 
-  >>> f.apply(params, None, 1)
-  DeviceArray(2., dtype=float32)
+  >>> print(f.apply(params, None, 1))
+  2.0
 
   It is expected that your program will at some point produce updated parameters
   and you will want to re-apply ``apply``. You can do this by calling ``apply``
@@ -277,8 +313,8 @@ def transform(f, *, apply_rng=True) -> Transformed:
 
   >>> new_params = {"my_module": {"w": jnp.array(2.)},
   ...               "my_module_1": {"w": jnp.array(3.)}}
-  >>> f.apply(new_params, None, 2)
-  DeviceArray(9., dtype=float32, weak_type=True)
+  >>> print(f.apply(new_params, None, 2))
+  9.0
 
   If your transformed function needs to maintain internal state (e.g. moving
   averages in batch norm) then see :func:`transform_with_state`.
@@ -294,7 +330,7 @@ def transform(f, *, apply_rng=True) -> Transformed:
 
   if not apply_rng:
     raise ValueError(
-        "The apply_rng argument has been removed and k.transform "
+        "The apply_rng argument has been removed and hk.transform "
         "now *always* applies an rng.\n"
         "Replace hk.transform(..., apply_rng=False) with "
         "hk.without_apply_rng(hk.transform(...)).\n"
@@ -302,10 +338,13 @@ def transform(f, *, apply_rng=True) -> Transformed:
 
   return without_state(transform_with_state(f))
 
+COMPILED_FN_TYPES = (jax.lib.xla_extension.PjitFunction,
+                     jax.lib.xla_extension.PmapFunction)  # pytype: disable=name-error
+
 
 def check_not_jax_transformed(f):
   # TODO(tomhennigan): Consider `CompiledFunction = type(jax.jit(lambda: 0))`.
-  if isinstance(f, (jax.xla.xe.CompiledFunction, jax.xla.xe.PmapFunction)):  # pytype: disable=name-error
+  if isinstance(f, COMPILED_FN_TYPES):
     raise ValueError("A common error with Haiku is to pass an already jit "
                      "(or pmap) decorated function into hk.transform (e.g. "
                      "`hk.transform(jax.jit(f)))`. You should instead jit/pmap "
@@ -347,8 +386,8 @@ def transform_with_state(f) -> TransformedWithState:
   >>> params, state = f.init(None)
   >>> for _ in range(10):
   ...   counter, state = f.apply(params, state, None)
-  >>> counter
-  DeviceArray(9, dtype=int32)
+  >>> print(counter)
+  9
 
   Args:
     f: A function closing over :class:`Module` instances.
@@ -364,16 +403,18 @@ def transform_with_state(f) -> TransformedWithState:
       "An UnexpectedTracerError was raised while inside a Haiku transformed "
       "function (see error above).\n"
       "Hint: are you using a JAX transform or JAX control-flow function "
-      "(jax.vmap/jax.scan/...) inside a Haiku transform? You might want to use "
+      "(jax.vmap/jax.lax.scan/...) inside a Haiku transform? You might want to use "
       "the Haiku version of the transform instead (hk.vmap/hk.scan/...).\n"
       "See https://dm-haiku.readthedocs.io/en/latest/notebooks/transforms.html "
       "on why you can't use JAX transforms inside a Haiku module.")
 
+  f_sig = inspect.signature(f)
+
   def init_fn(
-      rng: Optional[Union[PRNGKey, int]],
+      rng: PRNGKey | int | None,
       *args,
       **kwargs,
-  ) -> Tuple[hk.Params, hk.State]:
+  ) -> tuple[hk.MutableParams, hk.MutableState]:
     """Initializes your function collecting parameters and state."""
     rng = to_prng_sequence(rng, err_msg=INIT_RNG_ERROR)
     with base.new_context(rng=rng) as ctx:
@@ -383,24 +424,52 @@ def transform_with_state(f) -> TransformedWithState:
         raise jax.errors.UnexpectedTracerError(unexpected_tracer_hint) from e
     return ctx.collect_params(), ctx.collect_initial_state()
 
+  init_fn.__signature__ = inspect.Signature(
+      parameters=[
+          inspect.Parameter(
+              "rng",
+              inspect.Parameter.POSITIONAL_OR_KEYWORD,
+              annotation=Optional[Union[PRNGKey, int]],
+          ),
+      ]
+      + list(f_sig.parameters.values()),
+      return_annotation=tuple[hk.Params, hk.State],
+      __validate_parameters__=False,
+  )
+
   def apply_fn(
-      params: Optional[hk.Params],
-      state: Optional[hk.State],
-      rng: Optional[Union[PRNGKey, int]],
+      params: hk.Params | None,
+      state: hk.State | None,
+      rng: PRNGKey | int | None,
       *args,
       **kwargs,
-  ) -> Tuple[Any, hk.State]:
+  ) -> tuple[Any, hk.MutableState]:
     """Applies your function injecting parameters and state."""
+    uses_state = state is not None
     params = check_mapping("params", params)
     state = check_mapping("state", state)
     rng = to_prng_sequence(
-        rng, err_msg=(APPLY_RNG_STATE_ERROR if state else APPLY_RNG_ERROR))
+        rng,
+        err_msg=(APPLY_RNG_STATE_ERROR if uses_state else APPLY_RNG_ERROR))
     with base.new_context(params=params, state=state, rng=rng) as ctx:
       try:
         out = f(*args, **kwargs)
       except jax.errors.UnexpectedTracerError as e:
         raise jax.errors.UnexpectedTracerError(unexpected_tracer_hint) from e
     return out, ctx.collect_state()
+
+  apply_fn.__signature__ = sig_add_state(inspect.Signature(
+      parameters=[
+          inspect.Parameter("params", inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                            annotation=Optional[hk.Params]),
+          inspect.Parameter("state", inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                            annotation=Optional[hk.State]),
+          inspect.Parameter("rng", inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                            annotation=Optional[Union[PRNGKey, int]]),
+      ] + list(f_sig.parameters.values()),
+      return_annotation=f_sig.return_annotation,
+      __validate_parameters__=False
+  ))
 
   tie_in_original_fn(f, init_fn, apply_fn)
 
@@ -415,24 +484,30 @@ def tie_in_original_fn(f, init_fn, apply_fn):
   apply_fn._original_fn = f  # pylint: disable=protected-access
 
 
-def get_original_fn(f: Union[TransformedT, Callable[..., Any]]):
+def get_original_fn(f: Transformed | TransformedWithState | Callable[..., Any]):
   if isinstance(f, (Transformed, TransformedWithState)):
     f = f.init
   return getattr(f, "_original_fn")
 
 
-def check_mapping(name: str, mapping: Optional[T]) -> T:
+def check_mapping(name: str, mapping: T | None) -> T:
   """Cleans inputs to apply_fn, providing better errors."""
-  # TODO(tomhennigan) Remove support for empty non-Mappings.
   if mapping is None:
     # Convert None to empty dict.
     mapping = dict()
   if not isinstance(mapping, Mapping):
-    raise TypeError(f"{name} argument does not appear valid: {mapping!r}. "
+    if type(mapping).__name__ == "_DictWrapper":
+      # TensorFlow's checkpointing infrastructure replaces `dict` instances on
+      # `tf.Module`s with a type that is not a `Mapping` instance.
+      return mapping
+
+    raise TypeError(f"{name} argument does not appear valid. It should be a "
+                    f"mapping but is of type {type(mapping)}. "
                     "For reference the parameters for apply are "
                     "`apply(params, rng, ...)`` for `hk.transform` and "
                     "`apply(params, state, rng, ...)` for "
-                    "`hk.transform_with_state`.")
+                    "`hk.transform_with_state`.\n"
+                    f"The argument was: {mapping!r}.")
   return mapping
 
 

@@ -48,9 +48,12 @@ setup(
     # Contained modules and scripts.
     packages=find_namespace_packages(exclude=['*_test.py', 'examples']),
     install_requires=_parse_requirements('requirements.txt'),
-    extras_require={'jax': _parse_requirements('requirements-jax.txt')},
+    extras_require={
+        'jax': _parse_requirements('requirements-jax.txt'),
+        'flax': _parse_requirements('requirements-flax.txt'),
+    },
     tests_require=_parse_requirements('requirements-test.txt'),
-    requires_python='>=3.7',
+    requires_python='>=3.10',
     include_package_data=True,
     zip_safe=False,
     # PyPI package information.
@@ -61,9 +64,8 @@ setup(
         'Intended Audience :: Science/Research',
         'License :: OSI Approved :: Apache Software License',
         'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.7',
-        'Programming Language :: Python :: 3.8',
-        'Programming Language :: Python :: 3.9',
+        'Programming Language :: Python :: 3.10',
+        'Programming Language :: Python :: 3.11',
         'Topic :: Scientific/Engineering :: Mathematics',
         'Topic :: Software Development :: Libraries :: Python Modules',
         'Topic :: Software Development :: Libraries',

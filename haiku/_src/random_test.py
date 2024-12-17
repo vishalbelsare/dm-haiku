@@ -14,14 +14,16 @@
 # ==============================================================================
 """Tests for haiku._src.random."""
 
+from collections.abc import Sequence
 import functools
 
 from absl.testing import absltest
+from absl.testing import parameterized
 from haiku._src import base
 from haiku._src import random
 from haiku._src import transform
 import jax
-from jax import prng
+import jax.extend as jex
 import jax.numpy as jnp
 import numpy as np
 
@@ -39,16 +41,16 @@ class RandomTest(absltest.TestCase):
 
     # With optimize_rng_use the keys returned should be equal to split(n).
     f_opt = transform.transform(random.optimize_rng_use(f))
-    jax.tree_multimap(assert_allclose,
-                      f_opt.apply({}, key),
-                      tuple(jax.random.split(key, 3))[1:])
+    jax.tree.map(
+        assert_allclose,
+        f_opt.apply({}, key),
+        tuple(jax.random.split(key, 3))[1:],
+    )
 
     # Without optimize_rng_use the keys should be equivalent to splitting in a
     # loop.
     f = transform.transform(f)
-    jax.tree_multimap(assert_allclose,
-                      f.apply({}, key),
-                      tuple(split_for_n(key, 2)))
+    jax.tree.map(assert_allclose, f.apply({}, key), tuple(split_for_n(key, 2)))
 
   def test_rbg_default_impl(self):
     with jax.default_prng_impl("rbg"):
@@ -58,39 +60,63 @@ class RandomTest(absltest.TestCase):
       out_key = apply({}, key)
       self.assertEqual(out_key.shape, (4,))
 
+  def test_rbg_default_impl_invalid_key_shape(self):
+    with jax.default_prng_impl("rbg"):
+      key = jax.random.PRNGKey(42)[0:2]
+      self.assertEqual(key.shape, (2,))
+      init, _ = transform.transform(base.next_rng_key)
+      with self.assertRaisesRegex(
+          ValueError, "Init must be called with an RNG"
+      ):
+        init(key)
 
-class CustomRNGTest(absltest.TestCase):
+  def test_invalid_key(self):
+    init, _ = transform.transform(base.next_rng_key)
+    with self.assertRaisesRegex(ValueError, "Init must be called with an RNG"):
+      init([1, 2])
 
-  def setUp(self):
-    super().setUp()
-    jax.config.update("jax_enable_custom_prng", True)
 
-  def tearDown(self):
-    super().tearDown()
-    jax.config.update("jax_enable_custom_prng", False)
+class CustomRNGTest(parameterized.TestCase):
 
-  def test_custom_key(self):
+  def test_non_custom_key(self):
+    init, _ = transform.transform(base.next_rng_key)
+    init(jax.random.PRNGKey(42))  # does not crash
+
+  @parameterized.parameters(False, True)
+  def test_custom_key(self, do_jit):
+    if do_jit:
+      self.skipTest("init returns nothing, so compilation may DCE it")
+
     count = 0
+
     def count_splits(_, num):
       nonlocal count
       count += 1
-      return jnp.zeros((num, 13), np.uint32)
+      num = tuple(num) if isinstance(num, Sequence) else (num,)
+      return jnp.zeros((*num, 13), np.uint32)
 
-    differently_shaped_prng_impl = prng.PRNGImpl(
+    # TODO(frostig): remove after JAX 0.4.20, use
+    # jex.random.define_prng_impl directly
+    if hasattr(jex.random, "define_prng_impl"):
+      def_prng_impl = jex.random.define_prng_impl
+    else:
+      def_prng_impl = jex.random.PRNGImpl
+
+    differently_shaped_prng_impl = def_prng_impl(
         # Testing a different key shape to make sure it's accepted by Haiku
         key_shape=(13,),
         seed=lambda _: jnp.zeros((13,), np.uint32),
         split=count_splits,
         random_bits=lambda *_, data: jnp.zeros(data, np.uint32),
-        fold_in=lambda key, _: key)
+        fold_in=lambda key, _: key,
+    )
 
     init, _ = transform.transform(base.next_rng_key)
-    key = prng.seed_with_impl(differently_shaped_prng_impl, 42)
+    if do_jit:
+      init = jax.jit(init)
+    key = jax.random.key(42, impl=differently_shaped_prng_impl)
     init(key)
     self.assertEqual(count, 1)
-    # testing if Tracers with a different key shape are accepted
-    jax.jit(init)(key)
-    self.assertEqual(count, 2)
 
 
 def split_for_n(key, n):

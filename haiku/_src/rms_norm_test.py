@@ -38,6 +38,10 @@ class RMSNormTest(parameterized.TestCase):
     norms.append(rms_norm.RMSNorm(axis=slice(2, None))(data))
     norms.append(rms_norm.RMSNorm(axis=slice(1, -1))(data))
 
+    norms.append(rms_norm.RMSNorm(axis=-1, param_axis=(-1,))(data))
+    norms.append(rms_norm.RMSNorm(axis=-1, param_axis=(-2, -1))(data))
+    norms.append(rms_norm.RMSNorm(axis=-1, param_axis=(0, 1))(data))
+    norms.append(rms_norm.RMSNorm(axis=-1, param_axis=(0, 1, 2, 3))(data))
     return norms
 
   def test_bf16(self):
@@ -49,7 +53,7 @@ class RMSNormTest(parameterized.TestCase):
     fwd = transform.transform(f)
     data = jnp.zeros([2, 3, 4, 5], dtype=jnp.bfloat16)
     params = fwd.init(jax.random.PRNGKey(428), data)
-    bf16_params = jax.tree_map(lambda t: t.astype(jnp.bfloat16), params)
+    bf16_params = jax.tree.map(lambda t: t.astype(jnp.bfloat16), params)
     self.assertEqual(fwd.apply(bf16_params, None, data).dtype, jnp.bfloat16)
 
   @test_utils.transform_and_run
@@ -94,6 +98,48 @@ class RMSNormTest(parameterized.TestCase):
     axis_outputs = axis_layer(inputs)
 
     np.testing.assert_array_equal(slice_outputs, axis_outputs)
+
+  @test_utils.transform_and_run
+  def test_simple_case_without_scale(self):
+    layer = rms_norm.RMSNorm(
+        axis=[1, 2], eps=0.0, create_scale=False)
+    inputs = np.full(shape=[2, 3, 3, 5], fill_value=2.0)
+    _ = layer(inputs)
+    assert "scale" not in layer.params_dict()
+
+  @parameterized.parameters(
+      (None, (6,)),
+      (-1, (6,)),
+      (-2, (1, 1, 5, 1)),
+      (-3, (1, 4, 1, 1)),
+      (-4, (3, 1, 1, 1)),
+      (0, (3, 1, 1, 1)),
+      (1, (1, 4, 1, 1)),
+      (2, (1, 1, 5, 1)),
+      (3, (6,)),
+      (slice(1, 3), (1, 4, 5, 1)),
+      (slice(0, 3, 2), (3, 1, 5, 1)),
+      (slice(-1, 0, -1), (1, 4, 5, 6)),
+  )
+  @test_utils.transform_and_run
+  def test_param_axis_sets_param_shape(self, param_axis, param_shape):
+    ln = rms_norm.RMSNorm(axis=-1, param_axis=param_axis)
+    ln(jnp.ones([3, 4, 5, 6]))
+    self.assertEqual(ln.params_dict()["rms_norm/scale"].shape, param_shape)
+
+  @parameterized.parameters(
+      ((0, 1, 2), (3, 4, 5, 1)),
+      ((-4, -2, -3), (3, 4, 5, 1)),
+      ((0, 1), (3, 4, 1, 1)),
+      ((0, 3), (3, 1, 1, 6)),
+      ((-4, -1), (3, 1, 1, 6)),
+      ((-1, -4), (3, 1, 1, 6)),
+  )
+  @test_utils.transform_and_run
+  def test_multiple_param_axis(self, param_axis, param_shape):
+    ln = rms_norm.RMSNorm(axis=-1, param_axis=param_axis)
+    ln(jnp.ones([3, 4, 5, 6]))
+    self.assertEqual(ln.params_dict()["rms_norm/scale"].shape, param_shape)
 
 if __name__ == "__main__":
   absltest.main()

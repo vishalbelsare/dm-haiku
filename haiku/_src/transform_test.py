@@ -14,16 +14,23 @@
 # ==============================================================================
 """Tests for haiku._src.transform."""
 
+from collections.abc import Mapping
 import inspect
 
 from absl.testing import absltest
 from absl.testing import parameterized
 from haiku._src import base
-from haiku._src import data_structures
+from haiku._src import multi_transform
 from haiku._src import test_utils
 from haiku._src import transform
+from haiku._src import typing
 import jax
 import jax.numpy as jnp
+import tensorflow as tf
+
+PRNGKey = typing.PRNGKey
+State = typing.State
+Params = typing.Params
 
 # TODO(tomhennigan) Improve test coverage.
 
@@ -71,9 +78,21 @@ class TransformTest(parameterized.TestCase):
         ValueError, "parameters must be created as part of `init`"):
       apply_fn(params, None)
 
+  def test_missing_parameter_without_apply_rng(self):
+    # Test we're getting a "missing parameter" error, not a "missing RNG" error.
+    initializer_with_rng = lambda s, d: base.next_rng_key()
+    _, apply_fn = multi_transform.without_apply_rng(
+        transform.transform(
+            lambda: base.get_parameter("w", [], init=initializer_with_rng)))
+
+    with self.assertRaisesRegex(ValueError,
+                                "parameters must be created as part of `init`"):
+      apply_fn({})
+
   @test_utils.transform_and_run(seed=None)
   def test_no_rng(self):
-    with self.assertRaisesRegex(ValueError, "must pass a non-None PRNGKey"):
+    with self.assertRaisesRegex(base.MissingRNGError,
+                                "must pass a non-None PRNGKey"):
       base.next_rng_key()
 
   def test_invalid_rng(self):
@@ -93,6 +112,15 @@ class TransformTest(parameterized.TestCase):
     with self.assertRaisesRegex(
         ValueError, "Apply must be called with an RNG as the third argument"):
       f.apply({}, {"x": {}}, "nonsense")
+
+  def test_invalid_rng_empty_state(self):
+    f = transform.transform_with_state(lambda: None)
+    with self.assertRaisesRegex(
+        ValueError, "Init must be called with an RNG as the first argument"):
+      f.init("nonsense")
+    with self.assertRaisesRegex(
+        ValueError, "Apply must be called with an RNG as the third argument"):
+      f.apply({}, {}, "nonsense")
 
   @parameterized.parameters(transform.transform,
                             transform.transform_with_state)
@@ -169,7 +197,7 @@ class TransformTest(parameterized.TestCase):
     def net():
       with base.custom_creator(counting_creator):
         for i in range(4):
-          base.get_parameter("w{}".format(i), [], init=jnp.zeros)
+          base.get_parameter(f"w{i}", [], init=jnp.zeros)
 
     init_fn, apply_fn = transform.transform(net)
 
@@ -281,7 +309,8 @@ class TransformTest(parameterized.TestCase):
 
     init_fn, _ = transform.without_state(transform.transform_with_state(f))
 
-    with self.assertRaisesRegex(ValueError, "use.*transform_with_state"):
+    with self.assertRaisesRegex(base.NonEmptyStateError,
+                                "use.*transform_with_state"):
       init_fn(None)
 
   def test_with_empty_state(self):
@@ -316,7 +345,7 @@ class TransformTest(parameterized.TestCase):
     obj_out, y = obj.forward.apply(params, None, x)
     self.assertEqual(y, 1)
     self.assertIs(obj, obj_out)
-    params = jax.tree_map(lambda v: v + 1, params)
+    params = jax.tree.map(lambda v: v + 1, params)
     obj_out, y = obj.forward.apply(params, None, x)
     self.assertEqual(y, 2)
     self.assertIs(obj, obj_out)
@@ -348,7 +377,7 @@ class TransformTest(parameterized.TestCase):
 
   def test_prng_sequence_invalid_input(self):
     with self.assertRaisesRegex(ValueError, "not a JAX PRNGKey"):
-      base.PRNGSequence("nonsense")
+      base.PRNGSequence("nonsense")  # type: ignore
 
   def test_prng_sequence_wrong_shape(self):
     with self.assertRaisesRegex(ValueError,
@@ -382,11 +411,11 @@ class TransformTest(parameterized.TestCase):
       w = base.get_parameter("w", [], init=jnp.zeros)
       return w
 
-    f = transform.without_apply_rng(transform.transform_with_state(f))
-    self.assertIsInstance(f, transform.TransformedWithState)
+    f_t = multi_transform.without_apply_rng(transform.transform_with_state(f))
+    self.assertIsInstance(f_t, transform.TransformedWithState)
 
-    f = transform.without_apply_rng(transform.transform(f))
-    self.assertIsInstance(f, transform.Transformed)
+    f_t = multi_transform.without_apply_rng(transform.transform(f))
+    self.assertIsInstance(f_t, transform.Transformed)
 
   def test_new_context(self):
     with base.new_context() as ctx:
@@ -410,7 +439,8 @@ class TransformTest(parameterized.TestCase):
     f = lambda: base.set_state("~", 1)
     f = transform.without_state(transform.transform_with_state(f))
     rng = jax.random.PRNGKey(42)
-    with self.assertRaisesRegex(ValueError, "use.*transform_with_state"):
+    with self.assertRaisesRegex(base.NonEmptyStateError,
+                                "use.*transform_with_state"):
       params = f.init(rng)
       f.apply(params, rng)
 
@@ -419,7 +449,7 @@ class TransformTest(parameterized.TestCase):
     f = transform.transform(lambda: l.append(transform.running_init()))
     f.init(None)
     f.apply({}, None)
-    init_value, apply_value = l  # pylint: disable=unbalanced-tuple-unpacking
+    init_value, apply_value = l  # pylint: disable=unbalanced-tuple-unpacking  # pytype: disable=bad-unpacking
     self.assertEqual(init_value, True)
     self.assertEqual(apply_value, False)
 
@@ -430,9 +460,8 @@ class TransformTest(parameterized.TestCase):
 
   @parameterized.parameters(
       None,
-      transform.without_apply_rng,
-      transform.without_state,
-      lambda f: transform.without_state(transform.without_apply_rng(f)))
+      multi_transform.without_apply_rng,
+      transform.with_empty_state)
   def test_persists_original_fn(self, without):
     orig_f = lambda: None
     f = transform.transform(orig_f)
@@ -442,6 +471,9 @@ class TransformTest(parameterized.TestCase):
 
   @parameterized.parameters(
       None,
+      transform.without_state,
+      multi_transform.without_apply_rng,
+      lambda f: transform.without_state(multi_transform.without_apply_rng(f)),
       lambda f: transform.with_empty_state(transform.without_state(f)))
   def test_persists_original_fn_transform_with_state(self, without):
     orig_f = lambda: None
@@ -468,25 +500,13 @@ class TransformTest(parameterized.TestCase):
     def f(rng):
       del rng
     self.assert_raises_by_name_error(
-        transform.without_apply_rng(transform_fn(f)))
+        multi_transform.without_apply_rng(transform_fn(f)))
 
   def assert_raises_by_name_error(self, f):
     with self.assertRaisesRegex(TypeError, "pass them positionally"):
       f.apply(params=None, state=None, rng=None)
 
-  @test_utils.with_environ("HAIKU_FLATMAPPING", None)
   def test_output_type_default(self):
-    self.assert_output_type(dict)
-
-  @test_utils.with_environ("HAIKU_FLATMAPPING", "0")
-  def test_output_type_env_var_0(self):
-    self.assert_output_type(dict)
-
-  @test_utils.with_environ("HAIKU_FLATMAPPING", "1")
-  def test_output_type_env_var_1(self):
-    self.assert_output_type(data_structures.FlatMap)
-
-  def assert_output_type(self, cls):
     def f():
       base.get_parameter("w", [], init=jnp.zeros)
       base.get_state("w", [], init=jnp.zeros)
@@ -497,10 +517,10 @@ class TransformTest(parameterized.TestCase):
     self.assertLen(params, 1)
     self.assertLen(state_in, 1)
     self.assertLen(state_out, 1)
-    self.assertEqual(type(params), cls)
-    self.assertEqual(type(params["~"]), cls)
-    self.assertEqual(type(state_in["~"]), cls)
-    self.assertEqual(type(state_out["~"]), cls)
+    self.assertEqual(type(params), dict)
+    self.assertEqual(type(params["~"]), dict)
+    self.assertEqual(type(state_in["~"]), dict)
+    self.assertEqual(type(state_out["~"]), dict)
 
   def test_unexpected_tracer_error_hint(self):
     def leaks_and_uses_tracer():
@@ -523,6 +543,97 @@ class TransformTest(parameterized.TestCase):
         ValueError,
         r"instead .*jax.jit\(hk.transform\(f\).apply\)"):
       hk_transform(f)
+
+  def test_with_tensorflow_dict_wrapper(self):
+    class Mod(tf.Module):
+
+      def __init__(self):
+        super().__init__()
+        self.x = {}
+
+    m = Mod().x
+    self.assertIsInstance(m, Mapping)
+    self.assertIs(transform.check_mapping("params", m), m)
+
+  def test_do_not_store(self):
+    def my_creator(next_creator, shape, dtype, init, context):
+      del next_creator, shape, dtype, init, context
+      return base.DO_NOT_STORE
+
+    def my_getter(next_getter, value, context):
+      assert value is base.DO_NOT_STORE
+      return next_getter(
+          context.original_init(context.original_shape, context.original_dtype))
+
+    def my_setter(next_setter, value, context):
+      del next_setter, value, context
+      return base.DO_NOT_STORE
+
+    def f():
+      with base.custom_creator(my_creator, state=True), \
+           base.custom_getter(my_getter, state=True), \
+           base.custom_setter(my_setter):
+        self.assertEqual(base.get_parameter("w", [], init=jnp.ones), 1)
+        self.assertEqual(base.get_state("s1", [], init=jnp.ones), 1)
+        base.set_state("s2", jnp.ones([]))
+
+    f = transform.transform_with_state(f)
+    params, state = f.init(None)
+    self.assertEmpty(params)
+    self.assertEmpty(state)
+    _, state = f.apply({}, {}, None)
+    self.assertEmpty(state)
+
+  def test_signature_transform_with_state(self):
+    @transform.transform_with_state
+    def f(pos, key=37) -> int:
+      del pos, key
+      return 2
+
+    def expected_f_init(
+        rng: PRNGKey | int | None, pos, key=37
+    ) -> tuple[Params, State]:
+      del rng, pos, key
+      raise NotImplementedError
+
+    def expected_f_apply(
+        params: Params | None,
+        state: State | None,
+        rng: PRNGKey | int | None,
+        pos,
+        key=37,
+    ) -> tuple[int, State]:
+      del params, state, rng, pos, key
+      raise NotImplementedError
+
+    self.assertEqual(
+        inspect.signature(f.init), inspect.signature(expected_f_init))
+    self.assertEqual(
+        inspect.signature(f.apply), inspect.signature(expected_f_apply))
+
+  def test_signature_transform(self):
+    @transform.transform
+    def f(pos, *, key: int = 37) -> int:
+      del pos, key
+      return 2
+    def expected_f_init(rng: PRNGKey | int | None,
+                        pos, *, key: int = 37) -> Params:
+      del rng, pos, key
+      raise NotImplementedError
+    def expected_f_apply(
+        params: Params | None, rng: PRNGKey | int | None,
+        pos, *, key: int = 37) -> int:
+      del params, rng, pos, key
+      raise NotImplementedError
+    self.assertEqual(
+        inspect.signature(f.init), inspect.signature(expected_f_init))
+    self.assertEqual(
+        inspect.signature(f.apply), inspect.signature(expected_f_apply))
+
+  def test_init_return_type_is_mutable(self):
+    init, _ = transform.transform(lambda: None)
+    params = init(None)
+    params["a"] = None  # Check type-checker does not complain.
 
 
 class ObjectWithTransform:

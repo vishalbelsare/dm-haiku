@@ -14,11 +14,11 @@
 # ==============================================================================
 """Summarises Haiku modules."""
 
+from collections.abc import Callable, Mapping, Sequence
 import dataclasses
 import functools
 import pprint
-import types
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, TypeVar, Union
+from typing import Any, TypeVar
 
 from haiku._src import base
 from haiku._src import data_structures
@@ -30,14 +30,17 @@ import jax.numpy as jnp
 import numpy as np
 import tabulate as tabulate_lib
 
+
 # If you are forking replace this block with `import haiku as hk`.
-hk = types.ModuleType("haiku")
-hk.Module = module_lib.Module
-hk.MethodContext = module_lib.MethodContext
-hk.intercept_methods = module_lib.intercept_methods
-hk.transform_with_state = transform.transform_with_state
-hk.Transformed = transform.Transformed
-hk.TransformedWithState = transform.TransformedWithState
+# pylint: disable=invalid-name
+class hk:
+  Module = module_lib.Module
+  MethodContext = module_lib.MethodContext
+  intercept_methods = module_lib.intercept_methods
+  transform_with_state = transform.transform_with_state
+  Transformed = transform.Transformed
+  TransformedWithState = transform.TransformedWithState
+# pylint: enable=invalid-name
 del module_lib
 
 T = TypeVar("T")
@@ -84,8 +87,8 @@ class ModuleDetails:
 
   @classmethod
   def of(cls, module: hk.Module, method_name: str) -> "ModuleDetails":
-    params = jax.tree_map(ArraySpec.from_array, module.params_dict())
-    state = jax.tree_map(ArraySpec.from_array, module.state_dict())
+    params = jax.tree.map(ArraySpec.from_array, module.params_dict())
+    state = jax.tree.map(ArraySpec.from_array, module.state_dict())
     return ModuleDetails(module=module, method_name=method_name, params=params,
                          state=state)
 
@@ -110,8 +113,8 @@ class MethodInvocation:
   """
 
   module_details: ModuleDetails
-  args_spec: Tuple[Any, ...]
-  kwargs_spec: Dict[str, Any]
+  args_spec: tuple[Any, ...]
+  kwargs_spec: dict[str, Any]
   output_spec: Any  # Actual: PyTree[Union[Any, ArraySpec]]
   context: hk.MethodContext
   call_stack: Sequence[ModuleDetails]
@@ -125,18 +128,18 @@ def get_call_stack() -> Sequence[ModuleDetails]:
 
 
 def to_spec(tree):
-  return jax.tree_map(
-      lambda x: ArraySpec.from_array(x) if isinstance(x, jnp.ndarray) else x,
-      tree)
+  return jax.tree.map(
+      lambda x: ArraySpec.from_array(x) if isinstance(x, jax.Array) else x, tree
+  )
 
 IGNORED_METHODS = ("__init__", "params_dict", "state_dict")
 
 
 def log_used_modules(
-    used_modules: List[MethodInvocation],
+    used_modules: list[MethodInvocation],
     next_f: Callable[..., T],
-    args: Tuple[Any, ...],
-    kwargs: Dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
     context: hk.MethodContext,
 ) -> T:
   """Method interceptor that logs used modules to the given list."""
@@ -162,7 +165,7 @@ def make_hk_transform_ignore_jax_transforms(f):
 
 
 def eval_summary(
-    f: Union[Callable[..., Any], hk.Transformed, hk.TransformedWithState],
+    f: Callable[..., Any] | hk.Transformed | hk.TransformedWithState,
 ) -> Callable[..., Sequence[MethodInvocation]]:
   """Records module method calls performed by ``f``.
 
@@ -216,7 +219,7 @@ def eval_summary(
 
   def wrapper(*args, **kwargs) -> Sequence[MethodInvocation]:
     used_modules = []
-    with sidechannel(used_modules):
+    with sidechannel(used_modules), jax.disable_jit():
       jax.eval_shape(init_apply, *args, **kwargs)
     return used_modules
 
@@ -238,7 +241,7 @@ class Column:
   align: str = "left"
 
 
-def owned_params(module: ModuleDetails) -> Mapping[str, jnp.ndarray]:
+def owned_params(module: ModuleDetails) -> Mapping[str, ArraySpec]:
   out = {}
   for fq_name, param in module.params.items():
     module_name, param_name = fq_name.rsplit("/", 1)
@@ -295,12 +298,14 @@ all_columns = {
     "output": Column("Output", format_output),
     "params_size": Column(
         "Param count",
-        lambda r: "{:,}".format(utils.tree_size(r.module_details.params)),
-        "right"),
+        lambda r: f"{utils.tree_size(r.module_details.params):,}",
+        "right",
+    ),
     "params_bytes": Column(
         "Param bytes",
         lambda r: utils.format_bytes(utils.tree_bytes(r.module_details.params)),
-        "right"),
+        "right",
+    ),
 }
 
 DEFAULT_COLUMNS = ("module", "config", "owned_params", "input", "output",
@@ -309,10 +314,10 @@ DEFAULT_FILTERS = ("has_output",)
 
 
 def tabulate(
-    f: Union[Callable[..., Any], hk.Transformed, hk.TransformedWithState],
+    f: Callable[..., Any] | hk.Transformed | hk.TransformedWithState,
     *,
-    columns: Optional[Sequence[str]] = DEFAULT_COLUMNS,
-    filters: Optional[Sequence[str]] = DEFAULT_FILTERS,
+    columns: Sequence[str] | None = DEFAULT_COLUMNS,
+    filters: Sequence[str] | None = DEFAULT_FILTERS,
     tabulate_kwargs={"tablefmt": "grid"},
 ) -> Callable[..., str]:
   # pylint: disable=line-too-long

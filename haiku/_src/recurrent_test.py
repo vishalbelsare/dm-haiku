@@ -46,13 +46,18 @@ class DuplicateCore(recurrent.RNNCore):
 
 def make_sequence(shape):
   # Skips 0 for meaningful multiplicative interactions.
-  return np.arange(1, np.product(shape) + 1, dtype=np.float32).reshape(shape)
+  return np.arange(1, np.prod(shape) + 1, dtype=np.float32).reshape(shape)
 
 
 class RecurrentTest(parameterized.TestCase):
 
   UNROLLS = (recurrent.dynamic_unroll, recurrent.static_unroll)
   CORES = (recurrent.VanillaRNN, recurrent.LSTM, recurrent.GRU)
+  UNROLL_KWARGS = ({}, {"unroll": 1}, {"unroll": 2}, {"unroll": 4})
+
+  def _skip_if_static_unroll(self, unroll, unroll_kwargs):
+    if unroll == recurrent.static_unroll and "unroll" in unroll_kwargs:
+      self.skipTest("static_unroll does not have an unroll parameter")
 
   def test_add_batch(self):
     sample_tree = dict(
@@ -71,41 +76,62 @@ class RecurrentTest(parameterized.TestCase):
   # These two tests assume that the core takes argument hidden_size, and the
   # output is a single tensor with the same size as hidden_size.
   # They should be generalized when new cores are added.
-  @parameterized.parameters(*it.product(UNROLLS, CORES))
+  @parameterized.parameters(*it.product(UNROLLS, CORES, UNROLL_KWARGS))
   @test_utils.transform_and_run
-  def test_core_unroll_unbatched(self, unroll, core_cls):
+  def test_core_unroll_unbatched(self, unroll, core_cls, unroll_kwargs):
+    self._skip_if_static_unroll(unroll, unroll_kwargs)
     seqs = make_sequence([8, 1])  # [T, F]
     core = core_cls(hidden_size=4)
-    out, _ = unroll(core, seqs, core.initial_state(batch_size=None))
+    out, _ = unroll(core, seqs, core.initial_state(batch_size=None),
+                    **unroll_kwargs)
     self.assertEqual(out.shape, (8, 4))
 
-  @parameterized.parameters(*it.product(UNROLLS, CORES))
+  @parameterized.parameters(*it.product(UNROLLS, CORES, UNROLL_KWARGS))
   @test_utils.transform_and_run
-  def test_core_unroll_batched(self, unroll, core_cls):
+  def test_core_unroll_batched(self, unroll, core_cls, unroll_kwargs):
+    self._skip_if_static_unroll(unroll, unroll_kwargs)
     seqs = make_sequence([4, 8, 1])  # [T, B, F]
     core = core_cls(hidden_size=4)
     batch_size = seqs.shape[1]
-    out, _ = unroll(core, seqs, core.initial_state(batch_size))
+    out, _ = unroll(core, seqs, core.initial_state(batch_size),
+                    **unroll_kwargs)
     self.assertEqual(out.shape, (4, 8, 4))
 
-  @parameterized.parameters(*UNROLLS)
+  @parameterized.parameters(*it.product(UNROLLS, UNROLL_KWARGS))
   @test_utils.transform_and_run
-  def test_core_unroll_nested(self, unroll):
+  def test_core_unroll_nested(self, unroll, unroll_kwargs):
+    self._skip_if_static_unroll(unroll, unroll_kwargs)
     seqs = make_sequence([4, 8, 1])
     batch_size = seqs.shape[1]
     core = DuplicateCore(recurrent.VanillaRNN(hidden_size=4))
-    outs, _ = unroll(core, seqs, core.initial_state(batch_size))
+    outs, _ = unroll(core, seqs, core.initial_state(batch_size),
+                     **unroll_kwargs)
     self.assertLen(outs, 2)
     for out in outs:
       self.assertEqual(out.shape, (4, 8, 4))
 
-  @parameterized.parameters(*UNROLLS)
-  def test_unroll_outside_transform(self, unroll):
+  @parameterized.parameters(*it.product(UNROLLS, UNROLL_KWARGS))
+  def test_unroll_outside_transform(self, unroll, unroll_kwargs):
+    self._skip_if_static_unroll(unroll, unroll_kwargs)
     core = lambda x, s: (x + 1, s + 1)
     seqs = jnp.arange(8)
-    outs, state = unroll(core, seqs, 0)
+    outs, state = unroll(
+        core, seqs, 0, **unroll_kwargs)
     np.testing.assert_allclose(outs, jnp.arange(9)[1:])
     np.testing.assert_allclose(state, 8)
+
+  @parameterized.parameters(*it.product(CORES, UNROLL_KWARGS))
+  @test_utils.transform_and_run
+  def test_dynamic_unroll_all_states(self, core_cls, unroll_kwargs):
+    seqs = make_sequence([4, 8, 1])  # [T, B, F]
+    core = core_cls(hidden_size=4)
+    batch_size = seqs.shape[1]
+    initial_state = core.initial_state(batch_size)
+    out, all_states = recurrent.dynamic_unroll(
+        core, seqs, initial_state, return_all_states=True, **unroll_kwargs)
+    self.assertEqual(out.shape, (4, 8, 4))
+    tree.map_structure(
+        lambda array: self.assertEqual(array.shape[0], 4), all_states)
 
 
 class VanillaRNNTest(absltest.TestCase):
@@ -114,11 +140,11 @@ class VanillaRNNTest(absltest.TestCase):
   def test_double_bias_length_parameters(self):
     double_bias = recurrent.VanillaRNN(1, double_bias=True)
     double_bias(jnp.zeros([1]), double_bias.initial_state(None))
-    double_bias_params = jax.tree_leaves(double_bias.params_dict())
+    double_bias_params = jax.tree.leaves(double_bias.params_dict())
 
     vanilla = recurrent.VanillaRNN(1, double_bias=False)
     vanilla(jnp.zeros([1]), vanilla.initial_state(None))
-    vanilla_params = jax.tree_leaves(vanilla.params_dict())
+    vanilla_params = jax.tree.leaves(vanilla.params_dict())
 
     self.assertLen(double_bias_params, len(vanilla_params) + 1)
 
@@ -176,7 +202,7 @@ class _DummyCore(recurrent.RNNCore):
     return inputs, prev_state
 
   def initial_state(self, batch_size):
-    return jax.tree_map(jnp.zeros_like, self._state)
+    return jax.tree.map(jnp.zeros_like, self._state)
 
 
 class _IncrementByOneCore(recurrent.RNNCore):
@@ -223,8 +249,14 @@ def static_unroll_with_states(core, inputs, state):
 
 class ResetCoreTest(parameterized.TestCase):
 
-  @parameterized.parameters(recurrent.dynamic_unroll, recurrent.static_unroll)
-  def test_resetting(self, unroll):
+  UNROLLS = (recurrent.dynamic_unroll, recurrent.static_unroll)
+  UNROLL_KWARGS = ({}, {"unroll": 2})
+
+  @parameterized.parameters(*it.product(UNROLLS, UNROLL_KWARGS))
+  def test_resetting(self, unroll, unroll_kwargs):
+    if unroll == recurrent.static_unroll and unroll_kwargs.get("unroll", 1) > 1:
+      self.skipTest("static_unroll does not have an unroll parameter")
+
     def net(seqs, should_reset):
       # seqs is [T, B, F].
       core = recurrent.LSTM(hidden_size=4)
@@ -240,10 +272,12 @@ class ResetCoreTest(parameterized.TestCase):
 
       # Unroll without access to intermediate states.
       dynamic_core_outs, dynamic_core_state = unroll(
-          core, seqs, core.initial_state(batch_size))
+          core, seqs, core.initial_state(batch_size),
+          **unroll_kwargs)
       dynamic_reset_outs, dynamic_reset_state = unroll(
           reset_core, (seqs, should_reset),
-          reset_core.initial_state(batch_size))
+          reset_core.initial_state(batch_size),
+          **unroll_kwargs)
 
       return dict(
           core_outs=core_outs,
@@ -327,9 +361,9 @@ class ResetCoreTest(parameterized.TestCase):
     ])
     np.testing.assert_allclose(result, expected_result, rtol=1e-6, atol=1e-6)
 
-  @parameterized.parameters(None, 3)
+  @parameterized.parameters(*it.product((None, 3), UNROLL_KWARGS))
   @test_utils.transform_and_run
-  def test_reversed_dynamic_unroll(self, batch_size):
+  def test_reversed_dynamic_unroll(self, batch_size, unroll_kwargs):
     reset_time = 2
     seq_len = 7
     state_size = 4
@@ -344,9 +378,11 @@ class ResetCoreTest(parameterized.TestCase):
 
     should_reset = inputs == reset_time
     fwd_result, _ = recurrent.dynamic_unroll(
-        core, (inputs[::-1], should_reset[::-1]), initial_state, reverse=False)
+        core, (inputs[::-1], should_reset[::-1]), initial_state, reverse=False,
+        **unroll_kwargs)
     rev_result, _ = recurrent.dynamic_unroll(
-        core, (inputs, should_reset), initial_state, reverse=True)
+        core, (inputs, should_reset), initial_state, reverse=True,
+        **unroll_kwargs)
     np.testing.assert_allclose(fwd_result[::-1], rev_result)
 
   @test_utils.transform_and_run
@@ -477,11 +513,16 @@ class BatchMajorUnrollTest(parameterized.TestCase):
     batch_major_outputs, batch_major_unroll_state_out = unroll(
         core, batch_major_inputs, initial_state, time_major=False)
 
-    jax.tree_multimap(np.testing.assert_array_equal,
-                      time_major_unroll_state_out, batch_major_unroll_state_out)
-    jax.tree_multimap(
+    jax.tree.map(
+        np.testing.assert_array_equal,
+        time_major_unroll_state_out,
+        batch_major_unroll_state_out,
+    )
+    jax.tree.map(
         lambda x, y: np.testing.assert_array_equal(x, jnp.swapaxes(y, 0, 1)),
-        time_major_outputs, batch_major_outputs)
+        time_major_outputs,
+        batch_major_outputs,
+    )
 
 
 if __name__ == "__main__":

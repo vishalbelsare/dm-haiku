@@ -14,15 +14,16 @@
 # ==============================================================================
 """Misc utility functions."""
 
-import collections
+import collections.abc
+from collections.abc import Sequence
 import decimal
 import inspect
 import pprint
 import re
-from typing import Any, Sequence, Tuple, Type, TypeVar, Union
+from typing import Any, TypeVar
 
 import jax
-import jax.numpy as jnp
+
 
 T = TypeVar("T")
 
@@ -38,7 +39,7 @@ def compare_or_false(a, b) -> bool:
     return False
 
 
-def auto_repr(cls: Type[Any], *args, **kwargs) -> str:
+def auto_repr(cls: type[Any], *args, **kwargs) -> str:
   """Derives a `__repr__` from constructor arguments of a given class.
 
       >>> class Foo:
@@ -97,7 +98,7 @@ def auto_repr(cls: Type[Any], *args, **kwargs) -> str:
 def fancy_repr(name: str, value: Any) -> str:
   try:
     repr_value = pprint.pformat(value)
-  # C++ obejcts by way of pybind11 may not pprint correctly, but do have repr.
+  # C++ objects by way of pybind11 may not pprint correctly, but do have repr.
   except TypeError:
     repr_value = repr(value)
 
@@ -113,10 +114,10 @@ def indent(amount: int, s: str) -> str:
 
 
 def replicate(
-    element: Union[T, Sequence[T]],
+    element: T | Sequence[T],
     num_times: int,
     name: str,
-) -> Tuple[T]:
+) -> tuple[T, ...]:
   """Replicates entry in `element` `num_times` if needed."""
   if (isinstance(element, (str, bytes)) or
       not isinstance(element, collections.abc.Sequence)):
@@ -126,8 +127,9 @@ def replicate(
   elif len(element) == num_times:
     return tuple(element)
   raise TypeError(
-      "{} must be a scalar or sequence of length 1 or sequence of length {}."
-      .format(name, num_times))
+      f"{name} must be a scalar or sequence of length 1 or sequence of "
+      f"length {num_times}."
+  )
 
 
 _SPATIAL_CHANNELS_FIRST = re.compile("^NC[^C]*$")
@@ -200,19 +202,19 @@ def tree_size(tree) -> int:
 
   And compare that with casting our parameters to bf16:
 
-  >>> params = jax.tree_map(lambda x: x.astype(jnp.bfloat16), params)
+  >>> params = jax.tree.map(lambda x: x.astype(jnp.bfloat16), params)
   >>> num_params = hk.data_structures.tree_size(params)
   >>> byte_size = hk.data_structures.tree_bytes(params)
   >>> print(f'{num_params} params, size: {byte_size / 1e6:.2f}MB')
   25557032 params, size: 51.11MB
 
   Args:
-    tree: A tree of jnp.ndarrays.
+    tree: A tree of jax.Arrays.
 
   Returns:
     The total size (number of elements) of the array(s) in the input.
   """
-  return sum(x.size for x in jax.tree_leaves(tree))
+  return sum(x.size for x in jax.tree.leaves(tree))
 
 
 def tree_bytes(tree) -> int:
@@ -238,19 +240,19 @@ def tree_bytes(tree) -> int:
 
   And compare that with casting our parameters to bf16:
 
-  >>> params = jax.tree_map(lambda x: x.astype(jnp.bfloat16), params)
+  >>> params = jax.tree.map(lambda x: x.astype(jnp.bfloat16), params)
   >>> num_params = hk.data_structures.tree_size(params)
   >>> byte_size = hk.data_structures.tree_bytes(params)
   >>> print(f'{num_params} params, size: {byte_size / 1e6:.2f}MB')
   25557032 params, size: 51.11MB
 
   Args:
-    tree: A tree of jnp.ndarrays.
+    tree: A tree of jax.Arrays.
 
   Returns:
     The total size in bytes of the array(s) in the input.
   """
-  return sum(x.size * x.dtype.itemsize for x in jax.tree_leaves(tree))
+  return sum(x.size * x.dtype.itemsize for x in jax.tree.leaves(tree))
 
 _CAMEL_TO_SNAKE_R = re.compile(r"((?<=[a-z0-9])[A-Z]|(?!^)[A-Z](?=[a-z]))")
 camel_to_snake = lambda value: _CAMEL_TO_SNAKE_R.sub(r"_\1", value).lower()
@@ -268,7 +270,7 @@ def simple_dtype(dtype) -> str:
   return dtype
 
 
-def format_array(x: jnp.ndarray) -> str:
+def format_array(x: Any) -> str:
   """Formats the given array showing dtype and shape info."""
   return simple_dtype(x.dtype) + "[" + ",".join(map(str, x.shape)) + "]"
 

@@ -15,26 +15,23 @@
 """Tests for haiku._src.module."""
 
 import abc
+from collections.abc import Callable, Sequence
 import contextlib
-import sys
-from typing import Callable, Optional, Sequence
+import dataclasses
+import inspect
+from typing import Optional, Protocol, TypeVar, runtime_checkable
 
 from absl.testing import absltest
 from absl.testing import parameterized
-import dataclasses
 from haiku._src import base
+from haiku._src import config
 from haiku._src import module
 from haiku._src import test_utils
 from haiku._src import transform
 import jax
 import jax.numpy as jnp
 
-# pylint: disable=g-import-not-at-top,g-multiple-import
-if sys.version_info < (3, 8):
-  from typing_extensions import Protocol, runtime_checkable
-else:
-  from typing import Protocol, runtime_checkable
-# pylint: enable=g-import-not-at-top,g-multiple-import
+ModuleT = TypeVar("ModuleT", bound=module.Module)
 
 
 # TODO(tomhennigan) Improve test coverage.
@@ -101,6 +98,32 @@ class ModuleTest(parameterized.TestCase):
     with self.assertRaisesRegex(
         ValueError, "Module name 'custom_name_4' is not unique"):
       EmptyModule(name="custom_name_4")
+
+  @test_utils.transform_and_run
+  def test_module_naming_explicit_numbering_zero_padded(self):
+    self.assertEqual(
+        EmptyModule(name="custom_name_000").module_name, "custom_name_000")
+    self.assertEqual(
+        EmptyModule(name="custom_name_001").module_name, "custom_name_001")
+    self.assertEqual(
+        EmptyModule(name="custom_name_002").module_name, "custom_name_002")
+    self.assertEqual(
+        EmptyModule(name="custom_name_007").module_name, "custom_name_007")
+
+  @test_utils.transform_and_run
+  def test_module_naming_explicit_numbering_zero_padded_reuse(self):
+    self.assertEqual(
+        EmptyModule(name="custom_name_007").module_name, "custom_name_007")
+    self.assertEqual(
+        EmptyModule(name="custom_name_007").module_name, "custom_name_007_1")
+
+  @test_utils.transform_and_run
+  def test_module_naming_explicit_numbering_zero_padded_vs_no_pad(self):
+    m1 = ScalarModule(name="scalar_module_1")
+    self.assertEqual(m1.module_name, "scalar_module_1")
+    m2 = ScalarModule(name="scalar_module_001")
+    self.assertEqual(m2.module_name, "scalar_module_001")
+    self.assertIsNot(m1(), m2())  # No parameter sharing.
 
   @test_utils.transform_and_run
   def test_flatten_invalid_name(self):
@@ -212,7 +235,7 @@ class ModuleTest(parameterized.TestCase):
     for i, mod in enumerate(mods):
       w = mod()
       if i:
-        self.assertEqual(mod.params_dict(), {"scalar_module_{}/w".format(i): w})
+        self.assertEqual(mod.params_dict(), {f"scalar_module_{i}/w": w})
       else:
         self.assertEqual(mod.params_dict(), {"scalar_module/w": w})
 
@@ -235,8 +258,7 @@ class ModuleTest(parameterized.TestCase):
     for i, mod in enumerate(mods):
       w = mod()
       if i:
-        self.assertEqual(mod.state_dict(),
-                         {"scalar_state_module_{}/w".format(i): w})
+        self.assertEqual(mod.state_dict(), {f"scalar_state_module_{i}/w": w})
       else:
         self.assertEqual(mod.state_dict(), {"scalar_state_module/w": w})
 
@@ -375,7 +397,7 @@ class ModuleTest(parameterized.TestCase):
 
     def add_one_interceptor(f, args, kwargs, context):
       call_count.append(None)
-      self.assertLen(context, 3)
+      self.assertLen(context, 4)
       self.assertIs(context.module, mod)
       self.assertEqual(context.method_name, "__call__")
       self.assertEqual(context.orig_method(2), 2)
@@ -432,6 +454,41 @@ class ModuleTest(parameterized.TestCase):
          module.intercept_methods(op_interceptor(lambda a: a + 1)):
       y = mod(x)
     self.assertEqual(y, (x + 1) ** 2)
+
+  @test_utils.transform_and_run
+  def test_intercept_methods_orig_class(self):
+    class A(module.Module):
+      def __call__(self):
+        pass
+
+    class B(A):
+      def __call__(self):  # pylint: disable=useless-parent-delegation
+        return super().__call__()
+
+    class C(B):
+      def __init__(self, name=None):
+        super().__init__(name=name)
+
+    log = []
+
+    def log_orig_class(f, args, kwargs, context):
+      log.append(
+          (type(context.module), context.orig_class, context.method_name))
+      return f(*args, **kwargs)
+
+    with module.intercept_methods(log_orig_class):
+      B()()
+      C()()
+
+    self.assertEqual(log, [
+        # b = B()
+        (B, B, "__init__"),
+        # b()
+        (B, B, "__call__"), (B, A, "__call__"),
+        # c = C()
+        (C, C, "__init__"),  # NOTE: No entry for `(module.Module, __init__)`.
+        # c()
+        (C, B, "__call__"), (C, A, "__call__")])
 
   @test_utils.transform_and_run
   def test_name_scope_trivial(self):
@@ -519,6 +576,15 @@ class ModuleTest(parameterized.TestCase):
       module.name_scope("foo")
 
   @test_utils.transform_and_run
+  def test_name_scope_method_name(self):
+    with module.name_scope("a", method_name="bar"):
+      self.assertEqual(module.Module().module_name, "a/~bar/module")
+    with module.name_scope("b", method_name="__init__"):
+      self.assertEqual(module.Module().module_name, "b/~/module")
+    with module.name_scope("c", method_name="__call__"):
+      self.assertEqual(module.Module().module_name, "c/module")
+
+  @test_utils.transform_and_run
   def test_is_protocol(self):
     self.assertFalse(getattr(module.Module, "_is_protocol"))
     self.assertFalse(getattr(ConcreteProtocolModule, "_is_protocol"))
@@ -588,6 +654,158 @@ class ModuleTest(parameterized.TestCase):
 
     self.assertEqual(log, ["__init__", "foo", "bar", "baz", "__call__"])
 
+  @test_utils.transform_and_run
+  def test_auto_repr(self):
+    m = IdentityModule()
+    self.assertEqual(str(m), "IdentityModule()")
+
+  @test_utils.transform_and_run
+  def test_repr_during_ctor(self):
+    # See https://github.com/google-deepmind/dm-haiku/issues/428 for other ways
+    # this can get triggered.
+
+    test = self
+
+    class MyModule(module.Module):
+      def __init__(self):
+        super().__init__()
+        test.assertEqual(repr(self), "MyModule()")
+
+    MyModule()  # Does not fail.
+
+  def test_signature(self):
+    captures_expected = inspect.Signature(
+        parameters=(
+            inspect.Parameter(
+                name="mod", kind=inspect.Parameter.POSITIONAL_OR_KEYWORD
+            ),
+        )
+    )
+    self.assertEqual(inspect.signature(CapturesModule), captures_expected)
+    datalinear_expected = inspect.Signature(
+        parameters=(
+            inspect.Parameter(
+                name="output_size",
+                kind=inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                annotation=int,
+            ),
+            inspect.Parameter(
+                name="name",
+                kind=inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                default=None,
+                annotation=Optional[str],
+            ),
+        ),
+        return_annotation=None,
+    )
+    self.assertEqual(inspect.signature(DataLinear), datalinear_expected)
+
+  @test_utils.transform_and_run
+  @config.with_config(module_auto_repr=False)
+  def test_config_disable_auto_repr(self):
+    self.assertRegex(str(IdentityModule()),
+                     "<.*.IdentityModule object at .*>")
+
+  @test_utils.transform_and_run
+  def test_attr_disable_auto_repr(self):
+    self.assertTrue(config.get_config().module_auto_repr)
+    self.assertRegex(str(NoAutoReprModule()),
+                     "<.*.NoAutoReprModule object at .*>")
+
+  @parameterized.parameters("foo", "foo/bar")
+  @test_utils.transform_and_run
+  def test_force_name_naming(self, name):
+    m0 = create_module_from_qualified_name(name)
+    m1 = module.Module(name=module.force_name(name))
+    m2 = module.Module(name=module.force_name(name))
+    self.assertEqual(m0.name, m1.name)
+    self.assertEqual(m0.module_name, m1.module_name)
+    self.assertEqual(m1.name, m2.name)
+    self.assertEqual(m1.module_name, m2.module_name)
+
+  @test_utils.transform_and_run
+  def test_force_name_reserves_name(self):
+    m0 = module.Module(name=module.force_name("foo"))
+    m1 = module.Module(name="foo")
+    self.assertEqual(m0.module_name, "foo")
+    self.assertEqual(m1.module_name, "foo_1")
+
+  @parameterized.parameters("foo", "foo/bar")
+  @test_utils.transform_and_run
+  def test_force_name_inside_module(self, name):
+    class CreatesInnerModule(module.Module):
+
+      def __call__(self):
+        return module.Module(name=module.force_name(name))
+
+    m0 = create_module_from_qualified_name(name)
+    m1 = CreatesInnerModule()()
+    m2 = module.Module(name=module.force_name(name))
+    self.assertEqual(m0.module_name, m1.module_name)
+    self.assertEqual(m1.module_name, m2.module_name)
+
+  @test_utils.transform_and_run
+  def test_force_name_inside_name_scope(self):
+    m0 = module.Module(name="foo")
+    with module.name_scope("bar"):
+      m1 = module.Module(name=module.force_name("foo"))
+    m2 = module.Module(name=module.force_name("foo"))
+    self.assertEqual(m0.module_name, m1.module_name)
+    self.assertEqual(m1.module_name, m2.module_name)
+
+  @parameterized.parameters("foo", "foo/bar")
+  @test_utils.transform_and_run
+  def test_force_name_parameter_reuse(self, name):
+    m0 = create_module_from_qualified_name(name=name, cls=ScalarModule)
+    m1 = ScalarModule(name=module.force_name(name))
+    self.assertIs(m0(), m1())
+
+  @test_utils.transform_and_run
+  def test_force_name_parameter_reuse_name_scope(self):
+    m0 = create_module_from_qualified_name(name="foo/bar/baz", cls=ScalarModule)
+    w0 = m0()
+    with module.name_scope(module.force_name("foo/bar/baz")):
+      w1 = base.get_parameter("w", [], init=jnp.zeros)
+    self.assertIs(w0, w1)
+
+  @test_utils.transform_and_run
+  def test_force_name_intercept_methods(self):
+    def change_prefix(old, new):
+      def my_interceptor(next_f, args, kwargs, context: module.MethodContext):
+        if type(context.module).__name__ == "NameScopeModule":
+          # Avoid infinite recursion for modules introduced by name_scope.
+          return next_f(*args, **kwargs)
+
+        name = context.module.module_name
+
+        # We expect all usages in the test to have this prefix. If you are
+        # forking this code you can probably remove this line.
+        self.assertStartsWith(name, old)
+
+        if name.startswith(old):
+          name = name.replace(old, new, 1)
+
+        with module.name_scope(module.force_name(name),
+                               method_name=context.method_name):
+          return next_f(*args, **kwargs)
+
+      return module.intercept_methods(my_interceptor)
+
+    with module.name_scope("outer"):
+      m1 = ParentModule()
+    with module.name_scope("inner"):
+      m2 = ParentModule()
+
+    m1()
+    with change_prefix("inner", "outer"):
+      m2()
+    self.assertIs(m1.child1.w, m2.child1.w)
+    self.assertIs(m1.child2.w, m2.child2.w)
+
+
+class NoAutoReprModule(module.Module):
+  AUTO_REPR = False
+
 
 class IdentityModule(module.Module):
 
@@ -632,7 +850,8 @@ class EmptyModule(module.Module):
 class ScalarModule(module.Module):
 
   def __call__(self):
-    return base.get_parameter("w", [], init=jnp.zeros)
+    self.w = base.get_parameter("w", [], init=jnp.zeros)
+    return self.w
 
 
 class ScalarStateModule(module.Module):
@@ -647,6 +866,10 @@ class ParentModule(module.Module):
     super().__init__()
     self.child1 = ScalarModule(name="child_module")
     self.child2 = ScalarModule(name="child_module")
+
+  def __call__(self):
+    self.child1()
+    self.child2()
 
 
 class MultipleForwardMethods(module.Module):
@@ -700,7 +923,7 @@ class TransparentModule(module.Module):
 class DataLinear(module.Module):
 
   output_size: int
-  name: Optional[str] = None
+  name: str | None = None
 
   def __call__(self, x):
     j, k = x.shape[-1], self.output_size
@@ -713,8 +936,8 @@ class DataLinear(module.Module):
 class DataMLP(module.Module):
 
   output_sizes: Sequence[int]
-  activation: Callable[[jnp.ndarray], jnp.ndarray] = jax.nn.relu
-  name: Optional[str] = None
+  activation: Callable[[jax.Array], jax.Array] = jax.nn.relu
+  name: str | None = None
 
   def __call__(self, x):
     for i, output_size in enumerate(self.output_sizes):
@@ -816,6 +1039,20 @@ class ModuleWithDoubleCall(module.Module):
   def __call__(self):
     self.foo()
     self.call_module = module.Module(name="child")
+
+
+def create_module_from_qualified_name(
+    name: str,
+    *,
+    cls: type[ModuleT] = module.Module,
+) -> ModuleT:
+  if "/" in name:
+    prefix, suffix = name.rsplit("/", 1)
+    with module.name_scope(prefix):
+      return cls(name=suffix)
+  else:
+    return cls(name=name)
+
 
 if __name__ == "__main__":
   absltest.main()

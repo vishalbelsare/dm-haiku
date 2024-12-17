@@ -15,9 +15,11 @@
 """Wrappers for JAX transformations that respect Haiku internal state."""
 
 import collections
+import collections.abc
+from collections.abc import Callable, Mapping, MutableMapping
 import functools
 import inspect
-from typing import Any, Callable, Mapping, MutableMapping, Optional, Tuple, TypeVar
+from typing import Any, TypeVar
 
 from haiku._src import base
 import jax
@@ -26,10 +28,11 @@ import jax.numpy as jnp
 InternalState = collections.namedtuple("InternalState", "params,state,rng")
 Bundle = Mapping[str, Mapping[str, Any]]
 T = TypeVar("T")
+python_map = map  # pylint: disable=invalid-name
 
 
 def copy_structure(bundle: T) -> T:
-  return jax.tree_map(lambda x: x, bundle)
+  return jax.tree.map(lambda x: x, bundle)
 
 
 def internal_state(*, params=True) -> InternalState:
@@ -113,8 +116,8 @@ def grad(fun, argnums=0, has_aux=False, holomorphic=False):
   >>> f = hk.transform_with_state(f)
   >>> x = jnp.array(2.)
   >>> params, state = jax.jit(f.init)(None, x)
-  >>> state["my_module"]["last"]
-  DeviceArray(4., dtype=float32, weak_type=True)
+  >>> print(state["my_module"]["last"])
+  4.0
 
   Args:
     fun: Function to be differentiated. Its arguments at positions specified by
@@ -207,7 +210,8 @@ def value_and_grad(fun, argnums=0, has_aux=False, holomorphic=False):
   @functools.wraps(fun)
   def stateful_fun(*args, **kwargs):
     state_in = kwargs.pop("hk_state")
-    with temporary_internal_state(state_in):
+    with temporary_internal_state(state_in), \
+         base.push_jax_trace_level():
       out = fun(*args, **kwargs)
       out, aux = (out if has_aux else (out, None))
       state_out = difference(state_in, internal_state())
@@ -242,7 +246,7 @@ TwoLevelMappingToBox = Mapping[Any, Mapping[Any, Box]]
 def box_and_fill_missing(
     a: TwoLevelMapping,
     b: TwoLevelMapping,
-) -> Tuple[TwoLevelMappingToBox, TwoLevelMappingToBox]:
+) -> tuple[TwoLevelMappingToBox, TwoLevelMappingToBox]:
   """Returns boxed two level mappings with the same structure.
 
   It is assumed that ``a`` is a subset of ``b``.
@@ -253,8 +257,8 @@ def box_and_fill_missing(
 
   Returns:
     A pair of two level mappings with ``Box`` wrapped leaves (suitable for use
-    with ``jax.tree_*``). The mappings have the contents of ``a`` and ``b``
-    respectively. Both mappings have the structure from ``b``. Any missing
+    with ``jax.tree_util.tree_*``). The mappings have the contents of ``a`` and
+    ``b`` respectively. Both mappings have the structure from ``b``. Any missing
     elements are set to ``Box(None)``.
   """
   out_a = {k: {} for k in b}
@@ -310,20 +314,22 @@ def difference(before: InternalState, after: InternalState) -> InternalState:
   is_new_param = lambda a, b: a is not b
   params_before, params_after = box_and_fill_missing(before.params,
                                                      after.params)
-  params_after = jax.tree_multimap(functools.partial(if_changed, is_new_param),
-                                   params_before, params_after)
+  params_after = jax.tree.map(
+      functools.partial(if_changed, is_new_param), params_before, params_after
+  )
 
   # state
   def is_new_state(a: base.StatePair, b: base.StatePair):
     return a.initial is not b.initial or a.current is not b.current
 
   state_before, state_after = box_and_fill_missing(before.state, after.state)
-  state_after = jax.tree_multimap(functools.partial(if_changed, is_new_state),
-                                  state_before, state_after)
+  state_after = jax.tree.map(
+      functools.partial(if_changed, is_new_state), state_before, state_after
+  )
 
   # rng
-  def is_new_rng(a: Optional[base.PRNGSequenceState],
-                 b: Optional[base.PRNGSequenceState]):
+  def is_new_rng(a: base.PRNGSequenceState | None,
+                 b: base.PRNGSequenceState | None):
     if a is None:
       return True
     assert len(a) == 2 and len(b) == 2
@@ -349,7 +355,8 @@ def thread_hk_state_in_kwargs(dec_fun):
     @functools.wraps(fun)
     def stateful_fun(*args, **kwargs):
       state_in = kwargs.pop("hk_state")
-      with temporary_internal_state(state_in, share_python_state=True):
+      with temporary_internal_state(state_in, share_python_state=True), \
+           base.push_jax_trace_level():
         out = fun(*args, **kwargs)
         return out, difference(state_in, internal_state())
 
@@ -369,23 +376,41 @@ def thread_hk_state_in_kwargs(dec_fun):
 
 
 jit = thread_hk_state_in_kwargs(jax.jit)
-remat = thread_hk_state_in_kwargs(jax.remat)
+
+# pylint: disable=unnecessary-lambda
+# pylint: disable=g-long-lambda
+# Calls factory function to create a function then applies it to arguments.
+_factory = lambda f: functools.wraps(f)(lambda *a, **k: f()(*a, **k))
+# Wraps a function inside a lambda to hide its identity.
+_lambda_wrap = lambda f: functools.wraps(f)(lambda *a, **k: f(*a, **k))
+# jax.remat foiling the function identity cache.
+_remat_no_cache = functools.wraps(jax.remat)(
+    lambda f, *args, **kwargs: functools.wraps(f)(
+        _factory(lambda: jax.remat(_lambda_wrap(f), *args, **kwargs))))
+# Haiku version of jax.remat.
+remat = thread_hk_state_in_kwargs(_remat_no_cache)
+# pylint: enable=unnecessary-lambda
+# pylint: enable=g-long-lambda
 
 
 def stateful_branch(branch_fun):
+  """Calls branch_fun passing internal state in and out."""
   @functools.wraps(branch_fun)
   def new_branch_fun(operand):
     state, operand = operand
-    with temporary_internal_state(state):
-      out = branch_fun(operand)
+    with temporary_internal_state(state), \
+         base.push_jax_trace_level():
+      out = branch_fun(*operand)
       reserve_up_to_full_rng_block()
       # TODO(tomhennigan) Return difference of state in/out here.
       return out, internal_state()
   return new_branch_fun
 
+SENTINEL = object()
 
-def _new_cond(pred, true_fun, false_fun, operand):
-  del pred, true_fun, false_fun, operand
+
+def _new_cond(pred, true_fun, false_fun, *operands, operand=SENTINEL):
+  del pred, true_fun, false_fun, operands, operand
 
 
 def _old_cond(pred, true_operand, true_fun, false_operand, false_fun):
@@ -406,22 +431,105 @@ def _memoize_by_id(f):
   return wrapper
 
 
+RUNNING_INIT_HINT = """
+Hint: A common mistake is to use hk.cond(..) or `hk.switch(..)` at init time and
+      create module parameters in one of the branches. At init time you should
+      unconditionally create the parameters of all modules you might want to use
+      at apply.
+
+For hk.cond():
+
+    if hk.running_init():
+      # At init time unconditionally create parameters in my_module.
+      my_other_module(x)
+      out = my_module(x)
+    else:
+      out = hk.cond(pred, my_module, my_other_module)
+
+For hk.switch():
+
+    branches = [my_module, lambda x: x]
+    if hk.running_init():
+      # At init time unconditionally create parameters in all branches.
+      for branch in branches:
+        out = my_module(x)
+    else:
+      out = hk.switch(idx, branches, x)
+""".strip()
+
+
+def with_output_structure_hint(f):
+  """Adds a helpful hint to branch structure errors."""
+  @functools.wraps(f)
+  def wrapper(*args, **kwargs):
+    try:
+      return f(*args, **kwargs)
+    except TypeError as e:
+      if not base.params_frozen() and "must have same type structure" in str(e):
+        raise TypeError(RUNNING_INIT_HINT) from e
+      else:
+        raise e
+  return wrapper
+
+
+# pylint: disable=g-doc-args
+@functools.wraps(jax.lax.cond)
+@with_output_structure_hint
 def cond(*args, **kwargs):
-  """Equivalent to :func:`jax.lax.cond` but with Haiku state passed in/out."""
+  """Equivalent to :func:`jax.lax.cond` but with Haiku state passed in/out.
+
+  >>> true_fn = hk.nets.ResNet50(10)
+  >>> false_fn = hk.Sequential([hk.Flatten(), hk.nets.MLP([300, 100, 10])])
+  >>> x = jnp.ones([1, 224, 224, 3])
+  >>> if hk.running_init():
+  ...   # At `init` run both branches to create parameters everywhere.
+  ...   true_fn(x)
+  ...   out = false_fn(x)
+  ... else:
+  ...   # At `apply` conditionally call one of the modules.
+  ...   i = jax.random.randint(hk.next_rng_key(), [], 0, 100)
+  ...   out = hk.cond(i > 50, true_fn, false_fn, x)
+
+  Args:
+    pred: Boolean scalar type.
+    true_fun: Function (A -> B), to be applied if ``pred`` is ``True``.
+    false_fun: Function (A -> B), to be applied if ``pred`` is ``False``.
+    operands: Operands (A) input to either branch depending on ``pred``. The
+      type can be a scalar, array, or any pytree (nested Python tuple/list/dict)
+      thereof.
+
+  Returns:
+    Value (B) of either ``true_fun(*operands)`` or ``false_fun(*operands)``,
+    depending on the value of ``pred``. The type can be a scalar, array, or any
+    pytree (nested Python tuple/list/dict) thereof.
+  """
+# pylint: enable=g-doc-args
   if not base.inside_transform():
     raise ValueError("hk.cond() should not be used outside of hk.transform(). "
                      "Use jax.cond() instead.")
 
   try:
     bound_args = inspect.signature(_old_cond).bind(*args, **kwargs)
+    pred, true_operand, true_fun, false_operand, false_fun = bound_args.args
+    if not callable(true_fun) or not callable(false_fun):
+      # Two operand new cond case: cond(pred, tf, ff, 1, 2)
+      raise TypeError
   except TypeError:
     bound_args = inspect.signature(_new_cond).bind(*args, **kwargs)
-    pred, true_fun, false_fun, operand = bound_args.args
+    bound_args.apply_defaults()
+    pred, true_fun, false_fun, *operands = bound_args.args
+    operand = bound_args.kwargs["operand"]
+    if operand is not SENTINEL:
+      if operands:
+        raise ValueError("When the operand keyword argument is used you cannot "  # pylint: disable=raise-missing-from
+                         "also pass operands positionally. Got "
+                         f"operand={operand} and *operands={tuple(operands)}")
+      operands = (operand,)
+      del operand
   else:
-    pred, true_operand, true_fun, false_operand, false_fun = bound_args.args
     true_fun = lambda op, f=true_fun: f(op[0])
     false_fun = lambda op, f=false_fun: f(op[1])
-    operand = (true_operand, false_operand)
+    operands = ((true_operand, false_operand),)
 
   reserve_up_to_full_rng_block()
   stateful_branch_mem = _memoize_by_id(stateful_branch)
@@ -429,13 +537,39 @@ def cond(*args, **kwargs):
   out, state = jax.lax.cond(pred,
                             true_fun=stateful_branch_mem(true_fun),
                             false_fun=stateful_branch_mem(false_fun),
-                            operand=(state, operand))
+                            operand=(state, operands))
   update_internal_state(state)
   return out
 
 
-def switch(index, branches, operand):
-  """Equivalent to :func:`jax.lax.switch` but with Haiku state passed in/out."""
+@with_output_structure_hint
+def switch(index, branches, *operands):
+  r"""Equivalent to :func:`jax.lax.switch` but with Haiku state passed in/out.
+
+  Note that creating parameters inside a switch branch is not supported, as such
+  at init time we recommend you unconditionally evaluate all branches of your
+  switch and only use the switch at apply. For example:
+
+  >>> experts = [hk.nets.MLP([300, 100, 10]) for _ in range(5)]
+  >>> x = jnp.ones([1, 28 * 28])
+  >>> if hk.running_init():
+  ...   # During init unconditionally create params/state for all experts.
+  ...   for expert in experts:
+  ...     out = expert(x)
+  ... else:
+  ...   # During apply conditionally apply (and update) only one expert.
+  ...   index = jax.random.randint(hk.next_rng_key(), [], 0, len(experts) - 1)
+  ...   out = hk.switch(index, experts, x)
+
+  Args:
+    index: Integer scalar type, indicating which branch function to apply.
+    branches: Sequence of functions (A -> B) to be applied based on index.
+    operands: Operands (A) input to whichever branch is applied.
+
+  Returns:
+    Value (B) of branch(\*operands) for the branch that was selected based on
+    index.
+  """
   if not base.inside_transform():
     raise ValueError(
         "hk.switch() should not be used outside of hk.transform(). "
@@ -445,7 +579,8 @@ def switch(index, branches, operand):
   stateful_branch_mem = _memoize_by_id(stateful_branch)
   state = internal_state()
   out, state = jax.lax.switch(
-      index, tuple(map(stateful_branch_mem, branches)), (state, operand))
+      index, tuple(python_map(stateful_branch_mem, branches)), (state, operands)
+  )
   update_internal_state(state)
   return out
 
@@ -454,10 +589,10 @@ def scan(f, init, xs, length=None, reverse=False, unroll=1):
   """Equivalent to :func:`jax.lax.scan` but with Haiku state passed in/out."""
   if not base.inside_transform():
     raise ValueError("hk.scan() should not be used outside of hk.transform(). "
-                     "Use jax.scan() instead.")
+                     "Use jax.lax.scan() instead.")
 
   if length is None:
-    length = jax.tree_leaves(xs)[0].shape[0]
+    length = jax.tree.leaves(xs)[0].shape[0]
 
   running_init_fn = not base.params_frozen()
 
@@ -466,19 +601,19 @@ def scan(f, init, xs, length=None, reverse=False, unroll=1):
     # carry contains the Haiku state and during `init` this may change structure
     # (e.g. as state is created).
     if not length:
-      x0 = jax.tree_map(lambda x: jnp.zeros(x.shape[1:], x.dtype), xs)
+      x0 = jax.tree.map(lambda x: jnp.zeros(x.shape[1:], x.dtype), xs)
       _, y0 = f(init, x0)
-      y0 = jax.tree_map(lambda y: jnp.zeros((0,) + y.shape, y.dtype), y0)
+      y0 = jax.tree.map(lambda y: jnp.zeros((0,) + y.shape, y.dtype), y0)
       return init, y0
 
     if reverse:
-      x0 = jax.tree_map(lambda x: x[-1], xs)
-      xs = jax.tree_map(lambda x: x[:-1], xs)
+      x0 = jax.tree.map(lambda x: x[-1], xs)
+      xs = jax.tree.map(lambda x: x[:-1], xs)
     else:
-      x0 = jax.tree_map(lambda x: x[0], xs)
-      xs = jax.tree_map(lambda x: x[1:], xs)
+      x0 = jax.tree.map(lambda x: x[0], xs)
+      xs = jax.tree.map(lambda x: x[1:], xs)
     init, y0 = f(init, x0)
-    y0 = jax.tree_map(lambda y: jnp.expand_dims(y, 0), y0)
+    y0 = jax.tree.map(lambda y: jnp.expand_dims(y, 0), y0)
     length -= 1
     if not length:
       return init, y0
@@ -487,7 +622,8 @@ def scan(f, init, xs, length=None, reverse=False, unroll=1):
   def stateful_fun(carry, x):
     carry, state = carry
     with temporary_internal_state(state):
-      with base.assert_no_new_parameters():
+      with base.assert_no_new_parameters(), \
+           base.push_jax_trace_level():
         carry, out = f(carry, x)
       reserve_up_to_full_rng_block()
       carry = (carry, internal_state(params=False))
@@ -511,11 +647,18 @@ def scan(f, init, xs, length=None, reverse=False, unroll=1):
 
   if running_init_fn:
     if reverse:
-      ys = jax.tree_multimap(lambda y0, ys: jnp.concatenate([ys, y0]), y0, ys)
+      ys = jax.tree.map(lambda y0, ys: jnp.concatenate([ys, y0]), y0, ys)
     else:
-      ys = jax.tree_multimap(lambda y0, ys: jnp.concatenate([y0, ys]), y0, ys)
+      ys = jax.tree.map(lambda y0, ys: jnp.concatenate([y0, ys]), y0, ys)
 
   return carry, ys
+
+
+def map(f, xs):  # pylint: disable=redefined-builtin
+  """Equivalent to :func:`jax.lax.map` but with Haiku state passed in/out."""
+  g = lambda _, x: ((), f(x))
+  _, ys = scan(g, (), xs)
+  return ys
 
 
 def fori_loop(lower, upper, body_fun, init_val):
@@ -528,7 +671,8 @@ def fori_loop(lower, upper, body_fun, init_val):
   @functools.wraps(body_fun)
   def pure_body_fun(i, val):
     state, val = val
-    with temporary_internal_state(state):
+    with temporary_internal_state(state), \
+         base.push_jax_trace_level():
       val = body_fun(i, val)
       reserve_up_to_full_rng_block()
       state = internal_state()
@@ -554,9 +698,10 @@ def fori_loop(lower, upper, body_fun, init_val):
   return val
 
 
-def maybe_get_axis(axis: int, arrays: Any) -> Optional[int]:
+def maybe_get_axis(axis: int | None, arrays: Any) -> int | None:
   """Returns `array.shape[axis]` for one of the arrays in the input."""
-  shapes = [a.shape for a in jax.tree_leaves(arrays)]
+  if axis is None: return None
+  shapes = [a.shape for a in jax.tree.leaves(arrays)]
   sizes = {s[axis] for s in shapes}
   if len(sizes) != 1:
     raise ValueError("Arrays must have the same mapped axis size, found "
@@ -568,37 +713,69 @@ def maybe_get_axis(axis: int, arrays: Any) -> Optional[int]:
 uniq = lambda x: tuple({k: None for k in x}.keys())
 
 
-def get_mapped_axis_size(args: Tuple[Any], in_axes: Any) -> int:
-  sizes = uniq(jax.tree_leaves(jax.tree_map(maybe_get_axis, in_axes, args)))
+def get_mapped_axis_size(args: tuple[Any], in_axes: Any) -> int:
+  sizes = uniq(
+      jax.tree.leaves(
+          jax.tree.map(
+              maybe_get_axis, in_axes, args, is_leaf=lambda x: x is None
+          )
+      )
+  )
   assert sizes, "hk.vmap should guarantee non-empty in_axes"
   # NOTE: We use the first in_axes regardless of how many non-unique values
   # there are to allow JAX to handle multiple conflicting sizes.
   return sizes[0]
 
 
+def add_split_rng_error(f):
+  """Adds a nice error message when split_rng is missing."""
+
+  @functools.wraps(f)
+  def wrapper(*args, **kwargs):
+    if "split_rng" not in kwargs and not wrapper.require_split_rng:
+      kwargs["split_rng"] = False
+
+    if "split_rng" not in kwargs:
+      try:
+        return f(*args, **kwargs)
+      except TypeError as e:
+        raise TypeError("Haiku now requires the split_rng argument to be "
+                        "passed to hk.vmap. If you have code using the old "
+                        "API which you cannot change, you can opt-out of this "
+                        "requirement by using "
+                        "`hk.vmap.require_split_rng = False`.") from e
+
+    return f(*args, **kwargs)
+
+  wrapper.require_split_rng = True
+  return wrapper
+
+list_to_tuple = lambda x: tuple(x) if isinstance(x, list) else x
+
+
+@add_split_rng_error
 def vmap(
     fun: Callable[..., Any],
     in_axes=0,
     out_axes=0,
-    axis_name: Optional[str] = None,
+    axis_name: str | None = None,
+    axis_size: int | None = None,
     *,
-    split_rng: bool = False,
+    split_rng: bool,
 ) -> Callable[..., Any]:
   """Equivalent to :func:`jax.vmap` with module parameters/state not mapped.
 
   The behaviour of Haiku random key APIs under :func:`vmap` is controlled by the
-  ``split_rng`` argument::
+  ``split_rng`` argument:
 
-  .. doctest::
+  >>> x = jnp.arange(2)
+  >>> f = hk.vmap(lambda _: hk.next_rng_key(), split_rng=False)
+  >>> key1, key2 = f(x)
+  >>> assert (key1 == key2).all()
 
-     >>> x = jnp.arange(2)
-     >>> f = hk.vmap(lambda _: hk.next_rng_key(), split_rng=False)
-     >>> key1, key2 = f(x)
-     >>> assert (key1 == key2).all()
-
-     >>> f = hk.vmap(lambda _: hk.next_rng_key(), split_rng=True)
-     >>> key1, key2 = f(x)
-     >>> assert not (key1 == key2).all()
+  >>> f = hk.vmap(lambda _: hk.next_rng_key(), split_rng=True)
+  >>> key1, key2 = f(x)
+  >>> assert not (key1 == key2).all()
 
   Random numbers in Haiku are typically used for two things, firstly for
   initialising model parameters, and secondly for creating random samples as
@@ -609,11 +786,16 @@ def vmap(
   initalizing (e.g. creating model parameters) or applying the model. An easy
   way to do this is to set ``split_rng=(not hk.running_init())``.
 
+  For more advanced use cases, such as mapping module parameters, we suggest
+  users instead use :func:`lift` or :func:`~haiku.experimental.transparent_lift`
+  in combination with :func:`jax.vmap`.
+
   Args:
     fun: See :func:`jax.vmap`.
     in_axes: See :func:`jax.vmap`.
     out_axes: See :func:`jax.vmap`.
     axis_name: See :func:`jax.vmap`.
+    axis_size: See :func:`jax.vmap`.
     split_rng: Controls whether random key APIs in Haiku (e.g.
       :func:`next_rng_key`) return different (aka. the internal key is split
       before calling your mapped function) or the same (aka. the internal key
@@ -624,16 +806,15 @@ def vmap(
     See :func:`jax.vmap`.
   """
 
-  if not jax.tree_leaves(in_axes):
+  if not jax.tree.leaves(in_axes):
     raise ValueError(
         f"{fun.__name__} must have at least one non-None value in in_axes "
         "to use with `hk.vmap`.")
 
-  # TODO(tomhennigan): Allow configuration of params/state mapping.
   params_axes = state_axes = None
   rng_axes = (0 if split_rng else None)
   haiku_state_axes = InternalState(params_axes, state_axes, rng_axes)
-  in_axes = in_axes, haiku_state_axes
+  in_axes = list_to_tuple(in_axes), haiku_state_axes
   out_axes = out_axes, haiku_state_axes
 
   @functools.wraps(fun)
@@ -644,7 +825,8 @@ def vmap(
       rng = base.PRNGSequence(state_in.rng).internal_state
       state_in = InternalState(state_in.params, state_in.state, rng)
 
-    with temporary_internal_state(state_in):
+    with temporary_internal_state(state_in), \
+         base.push_jax_trace_level():
       out = fun(*args)
       state_out = difference(state_in, internal_state())
       return out, state_out
@@ -654,7 +836,7 @@ def vmap(
     base.assert_context("vmap")
 
     mapped_pure_fun = jax.vmap(pure_fun, in_axes=in_axes, out_axes=out_axes,
-                               axis_name=axis_name)
+                               axis_name=axis_name, axis_size=axis_size)
     state = internal_state()
 
     if split_rng:
@@ -665,7 +847,20 @@ def vmap(
       saved_rng = state.rng
       state = InternalState(state.params, state.state, rng)
 
-    out, state = mapped_pure_fun(args, state)
+    try:
+      out, state = mapped_pure_fun(args, state)
+    except ValueError as err:
+      if split_rng and not base.params_frozen() and "out_axes" in str(err):
+        # TODO(lenamartens): add error for state too.
+        raise ValueError("hk.vmap does not support setting split_rng to True "
+                         "during initialization because it assumes parameters "
+                         "are always shared along the mapped dimension. "
+                         "Consider switching the value of `split_rng` to False "
+                         "during initialization through "
+                         "`split_rng=(not hk.running_init())`."
+                         ) from err
+      else:
+        raise err
 
     if split_rng:
       state = InternalState(state.params, state.state, saved_rng)
@@ -709,63 +904,18 @@ def while_loop(cond_fun, body_fun, init_val):
   @functools.wraps(body_fun)
   def pure_body_fun(val):
     val, state = val
-    with temporary_internal_state(state):
+    with temporary_internal_state(state), \
+         base.push_jax_trace_level():
       val = body_fun(val)
+      reserve_up_to_full_rng_block()
       state = internal_state()
       return val, state
 
+  reserve_up_to_full_rng_block()
   init_val = (init_val, internal_state())
   val, state = jax.lax.while_loop(pure_cond_fun, pure_body_fun, init_val)
   update_internal_state(state)
   return val
-
-
-def named_call(
-    fun: Callable[..., Any],
-    *,
-    name: Optional[str] = None,
-) -> Callable[..., Any]:
-  """Wraps a function in an XLA name_scope and maintains Haiku state."""
-
-  @functools.wraps(fun)
-  def hide_non_jaxtype_outputs(fun, side_channel):
-    @functools.wraps(fun)
-    def named_call_hidden_outputs(*args, **kwargs):
-      out = fun(*args, **kwargs)
-      out_leaves, treedef = jax.tree_flatten(out)
-
-      # Partition the output into valid and invalid JAX output. The invalid
-      # output types are not returned from the function, but moved out
-      # through a side channel.
-      # In order to easily merge the output back later, replace the elements
-      # of the other partition with Nones.
-      out_leaves = [(x, None) if isinstance(x, jnp.ndarray) else (None, x)
-                    for x in out_leaves]
-      jax_types, non_jaxtypes = zip(*out_leaves)
-      side_channel["non_jaxtypes"] = non_jaxtypes
-      side_channel["treedef"] = treedef
-      return jax_types
-    return named_call_hidden_outputs
-
-  @functools.wraps(fun)
-  def wrapper(*args, **kwargs):
-    side_channel = {"non_jaxtypes": [], "treedef": None}
-    wrapped_fun = hide_non_jaxtype_outputs(fun, side_channel)
-    if base.inside_transform():
-      wrapped_fun = thread_hk_state_in_kwargs(jax.named_call)(wrapped_fun,
-                                                              name=name)
-    else:
-      wrapped_fun = jax.named_call(wrapped_fun, name=name)
-
-    jax_types = wrapped_fun(*args, **kwargs)
-
-    non_jaxtypes = side_channel["non_jaxtypes"]
-    out_leaves = [y if x is None else x
-                  for x, y in zip(jax_types, non_jaxtypes)]
-    out = jax.tree_unflatten(side_channel["treedef"], out_leaves)
-
-    return out
-  return wrapper
 
 
 def eval_shape(fun, *args, **kwargs):
@@ -777,7 +927,8 @@ def eval_shape(fun, *args, **kwargs):
 
   @functools.wraps(fun)
   def stateless_fun(state, *args, **kwargs):
-    with temporary_internal_state(state):
+    with temporary_internal_state(state), \
+         base.push_jax_trace_level():
       out = fun(*args, **kwargs)
       # Don't return changed state
       return out

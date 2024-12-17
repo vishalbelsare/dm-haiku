@@ -25,7 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 
 
-_RESNETS = ["ResNet{}".format(i) for i in (18, 34, 50, 101, 152, 200)]
+_RESNETS = [f"ResNet{i}" for i in (18, 34, 50, 101, 152, 200)]
 _RESNET_NUM_PARAMS = [int(i * 1e6)
                       for i in (11.7, 21.8, 25.6, 44.5, 60.2, 64.7)]
 _RESNET_HAS_PROJECTION = [False, False, True, True, True, True]
@@ -97,7 +97,7 @@ class ResnetTest(parameterized.TestCase):
     image = jnp.ones([2, 64, 64, 3])
     rng = jax.random.PRNGKey(0)
     params, _ = model.init(rng, image)
-    num_params = sum(np.prod(p.shape).item() for p in jax.tree_leaves(params))
+    num_params = sum(np.prod(p.shape).item() for p in jax.tree.leaves(params))
     self.assertGreater(num_params, int(0.998 * expected_num_params))
     self.assertLess(num_params, int(1.002 * expected_num_params))
 

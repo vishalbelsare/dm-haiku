@@ -15,8 +15,8 @@
 """Haiku recurrent core."""
 
 import abc
-import types
-from typing import Any, NamedTuple, Optional, Sequence, Tuple, Union
+from collections.abc import Sequence
+from typing import Any, NamedTuple
 
 from haiku._src import base
 from haiku._src import basic
@@ -28,19 +28,23 @@ import jax
 import jax.nn
 import jax.numpy as jnp
 
+
 # If you are forking replace this with `import haiku as hk`.
-hk = types.ModuleType("haiku")
-hk.initializers = initializers
-hk.Linear = basic.Linear
-hk.ConvND = conv.ConvND
-hk.get_parameter = base.get_parameter
-hk.Module = module.Module
-hk.scan = stateful.scan
+# pylint: disable=invalid-name
+class hk:
+  initializers = initializers
+  Linear = basic.Linear
+  ConvND = conv.ConvND
+  get_parameter = base.get_parameter
+  Module = module.Module
+  scan = stateful.scan
+# pylint: enable=invalid-name
+# TODO(slebedev): This makes the module non-forkable.
 inside_transform = base.inside_transform
 del base, basic, conv, initializers, module
 
 
-class RNNCore(hk.Module):
+class RNNCore(abc.ABC, hk.Module):
   """Base class for RNN cores.
 
   This class defines the basic functionality that every core should
@@ -53,7 +57,7 @@ class RNNCore(hk.Module):
   """
 
   @abc.abstractmethod
-  def __call__(self, inputs, prev_state) -> Tuple[Any, Any]:
+  def __call__(self, inputs, prev_state) -> tuple[Any, Any]:
     """Run one step of the RNN.
 
     Args:
@@ -67,7 +71,7 @@ class RNNCore(hk.Module):
     """
 
   @abc.abstractmethod
-  def initial_state(self, batch_size: Optional[int]):
+  def initial_state(self, batch_size: int | None):
     """Constructs an initial state for this core.
 
     Args:
@@ -118,33 +122,35 @@ def static_unroll(core, input_sequence, initial_state, time_major=True):
   """
   output_sequence = []
   time_axis = 0 if time_major else 1
-  num_steps = jax.tree_leaves(input_sequence)[0].shape[time_axis]
+  num_steps = jax.tree.leaves(input_sequence)[0].shape[time_axis]
   state = initial_state
   for t in range(num_steps):
     if time_major:
-      inputs = jax.tree_map(lambda x, _t=t: x[_t], input_sequence)
+      inputs = jax.tree.map(lambda x, _t=t: x[_t], input_sequence)
     else:
-      inputs = jax.tree_map(lambda x, _t=t: x[:, _t], input_sequence)
+      inputs = jax.tree.map(lambda x, _t=t: x[:, _t], input_sequence)
     outputs, state = core(inputs, state)
     output_sequence.append(outputs)
 
   # Stack outputs along the time axis.
-  output_sequence = jax.tree_multimap(
-      lambda *args: jnp.stack(args, axis=time_axis),
-      *output_sequence)
+  output_sequence = jax.tree.map(
+      lambda *args: jnp.stack(args, axis=time_axis), *output_sequence
+  )
   return output_sequence, state
 
 
 def _swap_batch_time(inputs):
   """Swaps batch and time axes, assumed to be the first two axes."""
-  return jax.tree_map(lambda x: jnp.swapaxes(x, 0, 1), inputs)
+  return jax.tree.map(lambda x: jnp.swapaxes(x, 0, 1), inputs)
 
 
 def dynamic_unroll(core,
                    input_sequence,
                    initial_state,
                    time_major=True,
-                   reverse=False):
+                   reverse=False,
+                   return_all_states=False,
+                   unroll=1):
   """Performs a dynamic unroll of an RNN.
 
   An *unroll* corresponds to calling the core on each element of the
@@ -170,35 +176,52 @@ def dynamic_unroll(core,
       reversing the time dimension in both inputs and outputs. See
       https://jax.readthedocs.io/en/latest/_autosummary/jax.lax.scan.html for
       more details.
+    return_all_states: If True, all intermediate states are returned rather than
+      only the last one in time.
+    unroll: How many scan iterations to unroll within a single iteration
+      of a loop.
 
   Returns:
     A tuple with two elements:
       * **output_sequence** - An arbitrarily nested structure of tensors
         of shape ``[T, ...]`` if time-major, otherwise ``[B, T, ...]``.
-      * **final_state** - Core state at time step ``T``.
+      * **state_sequence** - If return_all_states is True, returns the sequence
+        of core states. Otherwise, core state at time step ``T``.
   """
   scan = hk.scan if inside_transform() else jax.lax.scan
+
   # Swap the input and output of core.
   def scan_f(prev_state, inputs):
     outputs, next_state = core(inputs, prev_state)
+    if return_all_states:
+      return next_state, (outputs, next_state)
     return next_state, outputs
+
   # TODO(hamzamerzic): Remove axis swapping once scan supports time axis arg.
   if not time_major:
     input_sequence = _swap_batch_time(input_sequence)
-  final_state, output_sequence = scan(
-      scan_f,
-      initial_state,
-      input_sequence,
-      reverse=reverse)
+
+  scan_result = scan(
+      scan_f, initial_state, input_sequence, reverse=reverse, unroll=unroll)
+  if return_all_states:
+    _, (output_sequence, state_sequence) = scan_result
+  else:
+    last_state, output_sequence = scan_result
+
   if not time_major:
     output_sequence = _swap_batch_time(output_sequence)
-  return output_sequence, final_state
+    if return_all_states:
+      state_sequence = _swap_batch_time(state_sequence)
+
+  if return_all_states:
+    return output_sequence, state_sequence
+  return output_sequence, last_state
 
 
-def add_batch(nest, batch_size: Optional[int]):
+def add_batch(nest, batch_size: int | None):
   """Adds a batch dimension at axis 0 to the leaves of a nested structure."""
   broadcast = lambda x: jnp.broadcast_to(x, (batch_size,) + x.shape)
-  return jax.tree_map(broadcast, nest)
+  return jax.tree.map(broadcast, nest)
 
 
 class VanillaRNN(RNNCore):
@@ -218,7 +241,7 @@ class VanillaRNN(RNNCore):
       self,
       hidden_size: int,
       double_bias: bool = True,
-      name: Optional[str] = None
+      name: str | None = None
   ):
     """Constructs a vanilla RNN core.
 
@@ -240,7 +263,7 @@ class VanillaRNN(RNNCore):
     out = jax.nn.relu(input_to_hidden(inputs) + hidden_to_hidden(prev_state))
     return out, out
 
-  def initial_state(self, batch_size: Optional[int]):
+  def initial_state(self, batch_size: int | None):
     state = jnp.zeros([self.hidden_size])
     if batch_size is not None:
       state = add_batch(state, batch_size)
@@ -254,8 +277,8 @@ class LSTMState(NamedTuple):
     hidden: Hidden state.
     cell: Cell state.
   """
-  hidden: jnp.ndarray
-  cell: jnp.ndarray
+  hidden: jax.Array
+  cell: jax.Array
 
 
 class LSTM(RNNCore):
@@ -288,7 +311,7 @@ class LSTM(RNNCore):
       the beginning of the training.
   """
 
-  def __init__(self, hidden_size: int, name: Optional[str] = None):
+  def __init__(self, hidden_size: int, name: str | None = None):
     """Constructs an LSTM.
 
     Args:
@@ -300,9 +323,9 @@ class LSTM(RNNCore):
 
   def __call__(
       self,
-      inputs: jnp.ndarray,
+      inputs: jax.Array,
       prev_state: LSTMState,
-  ) -> Tuple[jnp.ndarray, LSTMState]:
+  ) -> tuple[jax.Array, LSTMState]:
     if len(inputs.shape) > 2 or not inputs.shape:
       raise ValueError("LSTM input must be rank-1 or rank-2.")
     x_and_h = jnp.concatenate([inputs, prev_state.hidden], axis=-1)
@@ -315,7 +338,7 @@ class LSTM(RNNCore):
     h = jax.nn.sigmoid(o) * jnp.tanh(c)
     return h, LSTMState(h, c)
 
-  def initial_state(self, batch_size: Optional[int]) -> LSTMState:
+  def initial_state(self, batch_size: int | None) -> LSTMState:
     state = LSTMState(hidden=jnp.zeros([self.hidden_size]),
                       cell=jnp.zeros([self.hidden_size]))
     if batch_size is not None:
@@ -359,8 +382,8 @@ class ConvNDLSTM(RNNCore):
       num_spatial_dims: int,
       input_shape: Sequence[int],
       output_channels: int,
-      kernel_shape: Union[int, Sequence[int]],
-      name: Optional[str] = None,
+      kernel_shape: int | Sequence[int],
+      name: str | None = None,
   ):
     """Constructs a convolutional LSTM.
 
@@ -383,7 +406,7 @@ class ConvNDLSTM(RNNCore):
       self,
       inputs,
       state: LSTMState,
-  ) -> Tuple[jnp.ndarray, LSTMState]:
+  ) -> tuple[jax.Array, LSTMState]:
     input_to_hidden = hk.ConvND(
         num_spatial_dims=self.num_spatial_dims,
         output_channels=4 * self.output_channels,
@@ -404,7 +427,7 @@ class ConvNDLSTM(RNNCore):
     h = jax.nn.sigmoid(o) * jnp.tanh(c)
     return h, LSTMState(h, c)
 
-  def initial_state(self, batch_size: Optional[int]) -> LSTMState:
+  def initial_state(self, batch_size: int | None) -> LSTMState:
     shape = self.input_shape + (self.output_channels,)
     state = LSTMState(jnp.zeros(shape), jnp.zeros(shape))
     if batch_size is not None:
@@ -419,8 +442,8 @@ class Conv1DLSTM(ConvNDLSTM):  # pylint: disable=empty-docstring
       self,
       input_shape: Sequence[int],
       output_channels: int,
-      kernel_shape: Union[int, Sequence[int]],
-      name: Optional[str] = None,
+      kernel_shape: int | Sequence[int],
+      name: str | None = None,
   ):
     """Constructs a 1-D convolutional LSTM.
 
@@ -447,8 +470,8 @@ class Conv2DLSTM(ConvNDLSTM):  # pylint: disable=empty-docstring
       self,
       input_shape: Sequence[int],
       output_channels: int,
-      kernel_shape: Union[int, Sequence[int]],
-      name: Optional[str] = None,
+      kernel_shape: int | Sequence[int],
+      name: str | None = None,
   ):
     """Constructs a 2-D convolutional LSTM.
 
@@ -475,8 +498,8 @@ class Conv3DLSTM(ConvNDLSTM):  # pylint: disable=empty-docstring
       self,
       input_shape: Sequence[int],
       output_channels: int,
-      kernel_shape: Union[int, Sequence[int]],
-      name: Optional[str] = None,
+      kernel_shape: int | Sequence[int],
+      name: str | None = None,
   ):
     """Constructs a 3-D convolutional LSTM.
 
@@ -521,10 +544,10 @@ class GRU(RNNCore):
   def __init__(
       self,
       hidden_size: int,
-      w_i_init: Optional[hk.initializers.Initializer] = None,
-      w_h_init: Optional[hk.initializers.Initializer] = None,
-      b_init: Optional[hk.initializers.Initializer] = None,
-      name: Optional[str] = None,
+      w_i_init: hk.initializers.Initializer | None = None,
+      w_h_init: hk.initializers.Initializer | None = None,
+      b_init: hk.initializers.Initializer | None = None,
+      name: str | None = None,
   ):
     super().__init__(name=name)
     self.hidden_size = hidden_size
@@ -559,7 +582,7 @@ class GRU(RNNCore):
     next_state = (1 - z) * state + z * a
     return next_state, next_state
 
-  def initial_state(self, batch_size: Optional[int]):
+  def initial_state(self, batch_size: int | None):
     state = jnp.zeros([self.hidden_size])
     if batch_size is not None:
       state = add_batch(state, batch_size)
@@ -576,7 +599,7 @@ class IdentityCore(RNNCore):
   def __call__(self, inputs, state):
     return inputs, state
 
-  def initial_state(self, batch_size: Optional[int]):
+  def initial_state(self, batch_size: int | None):
     return ()
 
 
@@ -603,7 +626,7 @@ class ResetCore(RNNCore):
   ``should_reset`` nest compatible with the state structure.
   """
 
-  def __init__(self, core: RNNCore, name: Optional[str] = None):
+  def __init__(self, core: RNNCore, name: str | None = None):
     super().__init__(name=name)
     self.core = core
 
@@ -624,10 +647,10 @@ class ResetCore(RNNCore):
       Tuple of the wrapped core's ``output, next_state``.
     """
     inputs, should_reset = inputs
-    if jax.treedef_is_leaf(jax.tree_structure(should_reset)):
+    if jax.tree_util.treedef_is_leaf(jax.tree.structure(should_reset)):
       # Equivalent to not tree.is_nested, but with support for Jax extensible
       # pytrees.
-      should_reset = jax.tree_map(lambda _: should_reset, state)
+      should_reset = jax.tree.map(lambda _: should_reset, state)
 
     # We now need to manually pad 'on the right' to ensure broadcasting operates
     # correctly.
@@ -675,24 +698,25 @@ class ResetCore(RNNCore):
     # >> batch_entry 1:
     # >>  [[0. 0.]
     # >>  [0. 0.]]
-    should_reset = jax.tree_multimap(_validate_and_conform, should_reset, state)
+    should_reset = jax.tree.map(_validate_and_conform, should_reset, state)
     if self._is_batched(state):
-      batch_size = jax.tree_leaves(inputs)[0].shape[0]
+      batch_size = jax.tree.leaves(inputs)[0].shape[0]
     else:
       batch_size = None
-    initial_state = jax.tree_multimap(
-        lambda s, i: i.astype(s.dtype), state, self.initial_state(batch_size))
-    state = jax.tree_multimap(jnp.where, should_reset, initial_state, state)
+    initial_state = jax.tree.map(
+        lambda s, i: i.astype(s.dtype), state, self.initial_state(batch_size)
+    )
+    state = jax.tree.map(jnp.where, should_reset, initial_state, state)
     return self.core(inputs, state)
 
-  def initial_state(self, batch_size: Optional[int]):
+  def initial_state(self, batch_size: int | None):
     return self.core.initial_state(batch_size)
 
   def _is_batched(self, state):
-    state = jax.tree_leaves(state)
+    state = jax.tree.leaves(state)
     if not state:  # Empty state is treated as unbatched.
       return False
-    batched = jax.tree_leaves(self.initial_state(batch_size=1))
+    batched = jax.tree.leaves(self.initial_state(batch_size=1))
     return all(b.shape[1:] == s.shape[1:] for b, s in zip(batched, state))
 
 
@@ -703,7 +727,7 @@ class _DeepRNN(RNNCore):
       self,
       layers: Sequence[Any],
       skip_connections: bool,
-      name: Optional[str] = None
+      name: str | None = None
   ):
     super().__init__(name=name)
     self.layers = layers
@@ -720,10 +744,16 @@ class _DeepRNN(RNNCore):
     next_states = []
     outputs = []
     state_idx = 0
-    concat = lambda *args: jnp.concatenate(args, axis=-1)
     for idx, layer in enumerate(self.layers):
       if self.skip_connections and idx > 0:
-        current_inputs = jax.tree_multimap(concat, inputs, current_inputs)
+        current_inputs = jax.tree.map(
+            lambda x, *args: (
+                None if x is None else jnp.concatenate((x,) + args, axis=-1)
+            ),
+            inputs,
+            current_inputs,
+            is_leaf=lambda x: x is None,
+        )
 
       if isinstance(layer, RNNCore):
         current_inputs, next_state = layer(current_inputs, state[state_idx])
@@ -734,13 +764,13 @@ class _DeepRNN(RNNCore):
         current_inputs = layer(current_inputs)
 
     if self.skip_connections:
-      out = jax.tree_multimap(concat, *outputs)
+      out = jax.tree.map(lambda *args: jnp.concatenate(args, axis=-1), *outputs)
     else:
       out = current_inputs
 
     return out, tuple(next_states)
 
-  def initial_state(self, batch_size: Optional[int]):
+  def initial_state(self, batch_size: int | None):
     return tuple(
         layer.initial_state(batch_size)
         for layer in self.layers
@@ -761,12 +791,12 @@ class DeepRNN(_DeepRNN):
   tuple.
   """
 
-  def __init__(self, layers: Sequence[Any], name: Optional[str] = None):
+  def __init__(self, layers: Sequence[Any], name: str | None = None):
     super().__init__(layers, skip_connections=False, name=name)
 
 
 def deep_rnn_with_skip_connections(layers: Sequence[RNNCore],
-                                   name: Optional[str] = None) -> RNNCore:
+                                   name: str | None = None) -> RNNCore:
   r"""Constructs a :class:`DeepRNN` with skip connections.
 
   Skip connections alter the dependency structure within a :class:`DeepRNN`.

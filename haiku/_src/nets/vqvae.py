@@ -14,25 +14,26 @@
 # ==============================================================================
 """Haiku implementation of VQ-VAE https://arxiv.org/abs/1711.00937."""
 
-import types
-from typing import Any, Optional
+from typing import Any
 
 from haiku._src import base
 from haiku._src import initializers
 from haiku._src import module
 from haiku._src import moving_averages
-
 import jax
 import jax.numpy as jnp
 
-# If forking replace this with `import haiku as hk`.
-hk = types.ModuleType("haiku")
-hk.get_parameter = base.get_parameter
-hk.get_state = base.get_state
-hk.set_state = base.set_state
-hk.initializers = initializers
-hk.ExponentialMovingAverage = moving_averages.ExponentialMovingAverage
-hk.Module = module.Module
+
+# If you are forking replace this with `import haiku as hk`.
+# pylint: disable=invalid-name
+class hk:
+  get_parameter = base.get_parameter
+  get_state = base.get_state
+  set_state = base.set_state
+  initializers = initializers
+  ExponentialMovingAverage = moving_averages.ExponentialMovingAverage
+  Module = module.Module
+# pylint: enable=invalid-name
 del base, initializers, module, moving_averages
 
 
@@ -67,7 +68,8 @@ class VectorQuantizer(hk.Module):
       num_embeddings: int,
       commitment_cost: float,
       dtype: Any = jnp.float32,
-      name: Optional[str] = None,
+      name: str | None = None,
+      cross_replica_axis: str | None = None,
   ):
     """Initializes a VQ-VAE module.
 
@@ -79,11 +81,16 @@ class VectorQuantizer(hk.Module):
         (see equation 4 in the paper - this variable is Beta).
       dtype: dtype for the embeddings variable, defaults to ``float32``.
       name: name of the module.
+      cross_replica_axis: If not ``None``, it should be a string representing
+        the axis name over which this module is being run within a
+        :func:`jax.pmap`. Supplying this argument means that perplexity is
+        calculated across all replicas on that axis.
     """
     super().__init__(name=name)
     self.embedding_dim = embedding_dim
     self.num_embeddings = num_embeddings
     self.commitment_cost = commitment_cost
+    self.cross_replica_axis = cross_replica_axis
 
     self._embedding_shape = [embedding_dim, num_embeddings]
     self._embedding_dtype = dtype
@@ -145,6 +152,8 @@ class VectorQuantizer(hk.Module):
     # Straight Through Estimator
     quantized = inputs + jax.lax.stop_gradient(quantized - inputs)
     avg_probs = jnp.mean(encodings, 0)
+    if self.cross_replica_axis:
+      avg_probs = jax.lax.pmean(avg_probs, axis_name=self.cross_replica_axis)
     perplexity = jnp.exp(-jnp.sum(avg_probs * jnp.log(avg_probs + 1e-10)))
 
     return {
@@ -206,8 +215,8 @@ class VectorQuantizerEMA(hk.Module):
       decay,
       epsilon: float = 1e-5,
       dtype: Any = jnp.float32,
-      cross_replica_axis: Optional[str] = None,
-      name: Optional[str] = None,
+      cross_replica_axis: str | None = None,
+      name: str | None = None,
   ):
     """Initializes a VQ-VAE EMA module.
 

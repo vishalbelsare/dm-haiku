@@ -15,7 +15,6 @@
 """Tests for haiku._src.mixed_precision."""
 
 import importlib
-from typing import Optional, Type
 
 from absl.testing import absltest
 from haiku._src import base
@@ -29,14 +28,11 @@ import jax.numpy as jnp
 import jmp
 
 
-def with_policy(cls: Type[module.Module], policy: Optional[jmp.Policy]):
+def with_policy(cls: type[module.Module], policy: jmp.Policy | None):
   def decorator(f):
     def wrapper(*args, **kwargs):
-      mixed_precision.set_policy(cls, policy)
-      try:
+      with mixed_precision.push_policy(cls, policy):
         return f(*args, **kwargs)
-      finally:
-        mixed_precision.clear_policy(cls)
     return wrapper
   return decorator
 
@@ -70,7 +66,7 @@ def transform_and_run_once(f, *args, **kwargs):
     params = f.init(rng, *args, **kwargs)
     out = f.apply(params, None, *args, **kwargs)
     return params, out
-  return jax.tree_map(lambda x: x.dtype, jax.eval_shape(g, *args, **kwargs))
+  return jax.tree.map(lambda x: x.dtype, jax.eval_shape(g, *args, **kwargs))
 
 
 class MixedPrecisionTest(absltest.TestCase):
@@ -156,6 +152,48 @@ class MixedPrecisionTest(absltest.TestCase):
     self.assertEqual(cls1()(x).dtype, jnp.float16)
     self.assertEqual(cls2()(x).dtype, jnp.bfloat16)
 
+  @test_utils.transform_and_run
+  def test_push_policy(self):
+    policy = jmp.get_policy('o=f16')
+    test = self
+
+    class FooModule(module.Module):
+
+      def __call__(self):
+        test.assertEqual(mixed_precision.current_policy(), policy)
+
+    mod = FooModule()
+    with mixed_precision.push_policy(FooModule, policy):
+      self.assertEqual(mixed_precision.get_policy(FooModule), policy)
+      mod()
+
+    self.assertIsNone(mixed_precision.get_policy(FooModule))
+
+  @test_utils.transform_and_run
+  def test_push_policy_maintains_old_policy(self):
+    old_policy = jmp.get_policy('o=f16')
+    new_policy = jmp.get_policy('o=f64')
+    self.assertIsNone(mixed_precision.get_policy(InnerModule))
+    mixed_precision.set_policy(InnerModule, old_policy)
+    with mixed_precision.push_policy(InnerModule, new_policy):
+      self.assertEqual(mixed_precision.get_policy(InnerModule), new_policy)
+    self.assertEqual(mixed_precision.get_policy(InnerModule), old_policy)
+    mixed_precision.clear_policy(InnerModule)
+
+  @test_utils.transform_and_run
+  def test_push_policy_not_allowed_in_method_of_same_class(self):
+    any_policy = jmp.get_policy('o=f16')
+
+    class PushesInMethod(module.Module):
+
+      def __call__(self):
+        with mixed_precision.push_policy(PushesInMethod, any_policy):
+          pass
+
+    mod = PushesInMethod()
+    with self.assertRaisesRegex(ValueError, 'same class is not supported'):
+      mod()
+
   @with_policy(InnerModule, jmp.get_policy('p=f16,c=f32,o=f16'))
   def test_clear_global_policy(self):
     def f():
@@ -200,8 +238,27 @@ class MixedPrecisionTest(absltest.TestCase):
     params, y = transform_and_run_once(
         lambda: conv_local.ConvND(2, 1, 1)(jnp.ones([1, 1, 1, 1])))
 
-    jax.tree_map(lambda p: self.assertEqual(p, jnp.float16), params)
+    jax.tree.map(lambda p: self.assertEqual(p, jnp.float16), params)
     self.assertEqual(y, jnp.float16)
+
+  @test_utils.transform_and_run
+  def test_policy_with_interceptor(self):
+    sidechannel = []
+    def my_interceptor(next_f, args, kwargs, context):
+      sidechannel.append(context)
+      return next_f(*args, **kwargs)
+
+    # We need this to make sure that the mixed precision interceptor is
+    # installed when we call set_policy (this only happens the first call).
+    mixed_precision.reset_thread_local_state_for_test()
+
+    policy = jmp.get_policy('p=f16,c=f32,o=f16')
+    with module.intercept_methods(my_interceptor):
+      mixed_precision.set_policy(OuterModule, policy)
+      x = OuterModule()()
+      self.assertEqual(x.dtype, jnp.float16)
+    # Outer.init, Outer.call, Inner.init, Inner.call
+    self.assertLen(sidechannel, 4)
 
 if __name__ == '__main__':
   absltest.main()

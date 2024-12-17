@@ -14,24 +14,26 @@
 # ==============================================================================
 """Depthwise Convolutional Haiku module."""
 
-import types
-from typing import Optional, Sequence, Union, Tuple
+from collections.abc import Sequence
 
 from haiku._src import base
 from haiku._src import initializers
 from haiku._src import module
 from haiku._src import utils
-
+import jax
 from jax import lax
 import jax.numpy as jnp
 import numpy as np
 
+
 # If you are forking replace this block with `import haiku as hk`.
-hk = types.ModuleType("haiku")
-hk.initializers = initializers
-hk.get_parameter = base.get_parameter
-hk.Module = module.Module
-hk.get_channel_index = utils.get_channel_index
+# pylint: disable=invalid-name
+class hk:
+  initializers = initializers
+  get_parameter = base.get_parameter
+  Module = module.Module
+  get_channel_index = utils.get_channel_index
+# pylint: enable=invalid-name
 del base, module, initializers
 
 DIMENSION_NUMBERS = {
@@ -53,15 +55,16 @@ class DepthwiseConvND(hk.Module):
   def __init__(
       self,
       channel_multiplier: int,
-      kernel_shape: Union[int, Sequence[int]],
+      kernel_shape: int | Sequence[int],
       num_spatial_dims: int,
       data_format: str,
-      stride: Union[int, Sequence[int]] = 1,
-      padding: Union[str, Sequence[Tuple[int, int]]] = "SAME",
+      stride: int | Sequence[int] = 1,
+      rate: int | Sequence[int] = 1,
+      padding: str | Sequence[tuple[int, int]] = "SAME",
       with_bias: bool = True,
-      w_init: Optional[hk.initializers.Initializer] = None,
-      b_init: Optional[hk.initializers.Initializer] = None,
-      name: Optional[str] = None,
+      w_init: hk.initializers.Initializer | None = None,
+      b_init: hk.initializers.Initializer | None = None,
+      name: str | None = None,
   ):
     """Construct an ND Depthwise Convolution.
 
@@ -76,6 +79,9 @@ class DepthwiseConvND(hk.Module):
         default, ``channels_last``. See :func:`get_channel_index`.
       stride: Optional stride for the kernel. Either an integer or a sequence of
         length ``num_spatial_dims``. Defaults to 1.
+      rate: Optional kernel dilation rate. Either an integer or a sequence of
+        length ``num_spatial_dims``. 1 corresponds to standard ND convolution,
+        ``rate > 1`` corresponds to dilated convolution. Defaults to 1.
       padding: Optional padding algorithm. Either ``VALID``, ``SAME`` or a
         sequence of ``before, after`` pairs. Defaults to ``SAME``. See:
         https://www.tensorflow.org/xla/operation_semantics#conv_convolution.
@@ -89,7 +95,7 @@ class DepthwiseConvND(hk.Module):
     self.kernel_shape = utils.replicate(kernel_shape, self.num_spatial_dims,
                                         "kernel_shape")
     self.lhs_dilation = (1,) * len(self.kernel_shape)
-    self.rhs_dilation = (1,) * len(self.kernel_shape)
+    self.rhs_dilation = utils.replicate(rate, num_spatial_dims, "rhs_dilation")
     self.channel_multiplier = channel_multiplier
     self.padding = padding
     self.stride = utils.replicate(stride, self.num_spatial_dims, "strides")
@@ -103,7 +109,7 @@ class DepthwiseConvND(hk.Module):
     else:
       self.dn = DIMENSION_NUMBERS_NCSPATIAL[self.num_spatial_dims]
 
-  def __call__(self, inputs: jnp.ndarray) -> jnp.ndarray:
+  def __call__(self, inputs: jax.Array) -> jax.Array:
     channel_index = hk.get_channel_index(self.data_format)
     w_shape = self.kernel_shape + (1, self.channel_multiplier *
                                    inputs.shape[channel_index])
@@ -143,14 +149,14 @@ class SeparableDepthwiseConv2D(hk.Module):
   def __init__(
       self,
       channel_multiplier: int,
-      kernel_shape: Union[int, Sequence[int]],
-      stride: Union[int, Sequence[int]] = 1,
-      padding: Union[str, Sequence[Tuple[int, int]]] = "SAME",
+      kernel_shape: int | Sequence[int],
+      stride: int | Sequence[int] = 1,
+      padding: str | Sequence[tuple[int, int]] = "SAME",
       with_bias: bool = True,
-      w_init: Optional[hk.initializers.Initializer] = None,
-      b_init: Optional[hk.initializers.Initializer] = None,
+      w_init: hk.initializers.Initializer | None = None,
+      b_init: hk.initializers.Initializer | None = None,
       data_format: str = "NHWC",
-      name: Optional[str] = None,
+      name: str | None = None,
   ):
     """Construct a Separable 2D Depthwise Convolution module.
 
@@ -194,7 +200,7 @@ class SeparableDepthwiseConv2D(hk.Module):
         b_init=b_init,
         data_format=data_format)
 
-  def __call__(self, inputs: jnp.ndarray) -> jnp.ndarray:
+  def __call__(self, inputs: jax.Array) -> jax.Array:
     return self._conv2(self._conv1(inputs))
 
 
@@ -204,14 +210,15 @@ class DepthwiseConv1D(DepthwiseConvND):
   def __init__(
       self,
       channel_multiplier: int,
-      kernel_shape: Union[int, Sequence[int]],
-      stride: Union[int, Sequence[int]] = 1,
-      padding: Union[str, Sequence[Tuple[int, int]]] = "SAME",
+      kernel_shape: int | Sequence[int],
+      stride: int | Sequence[int] = 1,
+      rate: int | Sequence[int] = 1,
+      padding: str | Sequence[tuple[int, int]] = "SAME",
       with_bias: bool = True,
-      w_init: Optional[hk.initializers.Initializer] = None,
-      b_init: Optional[hk.initializers.Initializer] = None,
+      w_init: hk.initializers.Initializer | None = None,
+      b_init: hk.initializers.Initializer | None = None,
       data_format: str = "NWC",
-      name: Optional[str] = None,
+      name: str | None = None,
   ):
     """Construct a 1D Depthwise Convolution.
 
@@ -222,6 +229,9 @@ class DepthwiseConv1D(DepthwiseConvND):
         length 1.
       stride: Optional stride for the kernel. Either an integer or a sequence of
         length 1. Defaults to 1.
+      rate: Optional kernel dilation rate. Either an integer or a sequence of
+        length 1. 1 corresponds to standard ND convolution,
+        ``rate > 1`` corresponds to dilated convolution. Defaults to 1.
       padding: Optional padding algorithm. Either ``VALID``, ``SAME`` or a
         sequence of ``before, after`` pairs. Defaults to ``SAME``. See:
         https://www.tensorflow.org/xla/operation_semantics#conv_convolution.
@@ -239,6 +249,7 @@ class DepthwiseConv1D(DepthwiseConvND):
         channel_multiplier=channel_multiplier,
         kernel_shape=kernel_shape,
         stride=stride,
+        rate=rate,
         padding=padding,
         with_bias=with_bias,
         w_init=w_init,
@@ -252,14 +263,15 @@ class DepthwiseConv2D(DepthwiseConvND):
   def __init__(
       self,
       channel_multiplier: int,
-      kernel_shape: Union[int, Sequence[int]],
-      stride: Union[int, Sequence[int]] = 1,
-      padding: Union[str, Sequence[Tuple[int, int]]] = "SAME",
+      kernel_shape: int | Sequence[int],
+      stride: int | Sequence[int] = 1,
+      rate: int | Sequence[int] = 1,
+      padding: str | Sequence[tuple[int, int]] = "SAME",
       with_bias: bool = True,
-      w_init: Optional[hk.initializers.Initializer] = None,
-      b_init: Optional[hk.initializers.Initializer] = None,
+      w_init: hk.initializers.Initializer | None = None,
+      b_init: hk.initializers.Initializer | None = None,
       data_format: str = "NHWC",
-      name: Optional[str] = None,
+      name: str | None = None,
   ):
     """Construct a 2D Depthwise Convolution.
 
@@ -270,6 +282,9 @@ class DepthwiseConv2D(DepthwiseConvND):
         length 2.
       stride: Optional stride for the kernel. Either an integer or a sequence of
         length 2. Defaults to 1.
+      rate: Optional kernel dilation rate. Either an integer or a sequence of
+        length 1. 1 corresponds to standard ND convolution,
+        ``rate > 1`` corresponds to dilated convolution. Defaults to 1.
       padding: Optional padding algorithm. Either ``VALID``, ``SAME`` or a
         sequence of ``before, after`` pairs. Defaults to ``SAME``. See:
         https://www.tensorflow.org/xla/operation_semantics#conv_convolution.
@@ -287,6 +302,7 @@ class DepthwiseConv2D(DepthwiseConvND):
         channel_multiplier=channel_multiplier,
         kernel_shape=kernel_shape,
         stride=stride,
+        rate=rate,
         padding=padding,
         with_bias=with_bias,
         w_init=w_init,
@@ -300,14 +316,15 @@ class DepthwiseConv3D(DepthwiseConvND):
   def __init__(
       self,
       channel_multiplier: int,
-      kernel_shape: Union[int, Sequence[int]],
-      stride: Union[int, Sequence[int]] = 1,
-      padding: Union[str, Sequence[Tuple[int, int]]] = "SAME",
+      kernel_shape: int | Sequence[int],
+      stride: int | Sequence[int] = 1,
+      rate: int | Sequence[int] = 1,
+      padding: str | Sequence[tuple[int, int]] = "SAME",
       with_bias: bool = True,
-      w_init: Optional[hk.initializers.Initializer] = None,
-      b_init: Optional[hk.initializers.Initializer] = None,
+      w_init: hk.initializers.Initializer | None = None,
+      b_init: hk.initializers.Initializer | None = None,
       data_format: str = "NDHWC",
-      name: Optional[str] = None,
+      name: str | None = None,
   ):
     """Construct a 3D Depthwise Convolution.
 
@@ -318,6 +335,9 @@ class DepthwiseConv3D(DepthwiseConvND):
         length 3.
       stride: Optional stride for the kernel. Either an integer or a sequence of
         length 3. Defaults to 1.
+      rate: Optional kernel dilation rate. Either an integer or a sequence of
+        length 1. 1 corresponds to standard ND convolution,
+        ``rate > 1`` corresponds to dilated convolution. Defaults to 1.
       padding: Optional padding algorithm. Either ``VALID``, ``SAME`` or a
         sequence of ``before, after`` pairs. Defaults to ``SAME``. See:
         https://www.tensorflow.org/xla/operation_semantics#conv_convolution.
@@ -335,6 +355,7 @@ class DepthwiseConv3D(DepthwiseConvND):
         channel_multiplier=channel_multiplier,
         kernel_shape=kernel_shape,
         stride=stride,
+        rate=rate,
         padding=padding,
         with_bias=with_bias,
         w_init=w_init,

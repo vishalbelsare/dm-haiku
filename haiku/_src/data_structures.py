@@ -20,13 +20,12 @@
 # for users.
 
 import collections
+from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 import contextlib
-import os
 import pprint
 import threading
-from typing import (Any, Callable, Dict, Generic, Mapping, NamedTuple, Optional,
-                    Sequence, TypeVar, Union)
-
+from typing import Any, Deque, Generic, NamedTuple, TypeVar
+from haiku._src import config
 from haiku._src import utils
 import jax
 
@@ -34,19 +33,18 @@ K = TypeVar("K")
 V = TypeVar("V")
 T = TypeVar("T")
 U = TypeVar("U")
-PyTreeDef = type(jax.tree_structure(None))
 
 
 class Stack(Generic[T]):
   """Stack supporting push/pop/peek."""
 
   def __init__(self):
-    self._storage = collections.deque()
+    self._storage: Deque[T] = collections.deque()
 
-  def __len__(self):
+  def __len__(self) -> int:
     return len(self._storage)
 
-  def __iter__(self):
+  def __iter__(self) -> Iterator[T]:
     return iter(reversed(self._storage))
 
   def clone(self):
@@ -57,6 +55,9 @@ class Stack(Generic[T]):
     for item in self._storage:
       s.push(fn(item))
     return s
+
+  def pushleft(self, elem: T):
+    self._storage.appendleft(elem)
 
   def push(self, elem: T):
     self._storage.append(elem)
@@ -71,7 +72,7 @@ class Stack(Generic[T]):
     return self._storage[depth]
 
   @contextlib.contextmanager
-  def __call__(self, elem):
+  def __call__(self, elem: T) -> Iterator[None]:  # pytype: disable=invalid-annotation
     self.push(elem)
     try:
       yield
@@ -121,7 +122,7 @@ def to_mutable_dict(mapping):
   return out
 
 
-def to_haiku_dict(structure: Mapping[K, V]) -> Mapping[K, V]:
+def to_haiku_dict(structure: Mapping[K, V]) -> MutableMapping[K, V]:
   """Returns a copy of the given two level structure.
 
   Uses the same mapping type as Haiku will return from ``init`` or ``apply``
@@ -133,15 +134,13 @@ def to_haiku_dict(structure: Mapping[K, V]) -> Mapping[K, V]:
   Returns:
     A new two level mapping with the same contents as the input.
   """
-  if os.environ.get("HAIKU_FLATMAPPING", "0").lower() not in ("", "0", "false"):
-    return to_immutable_dict(structure)
   return to_dict(structure)
 
 
 def _copy_structure(tree):
   """Returns a copy of the given structure."""
-  leaves, treedef = jax.tree_flatten(tree)
-  return jax.tree_unflatten(treedef, leaves)
+  leaves, treedef = jax.tree.flatten(tree)
+  return jax.tree.unflatten(treedef, leaves)
 
 
 def _to_dict_recurse(value: Any):
@@ -151,7 +150,7 @@ def _to_dict_recurse(value: Any):
     return _copy_structure(value)
 
 
-def to_dict(mapping: Mapping[str, Mapping[str, T]]) -> Dict[str, Dict[str, T]]:
+def to_dict(mapping: Mapping[str, Mapping[str, T]]) -> dict[str, dict[str, T]]:
   """Returns a ``dict`` copy of the given two level structure.
 
   This method is guaranteed to return a copy of the input structure (e.g. even
@@ -175,14 +174,14 @@ def _repr_item(k, v):
 
 class FlatComponents(NamedTuple):
   leaves: Sequence[Any]
-  structure: PyTreeDef
+  structure: jax.tree_util.PyTreeDef
 
 
 class FlatMap(Mapping[K, V]):
   """Immutable mapping with O(1) flatten and O(n) unflatten operation.
 
-  Warning: this type is only efficient when used with ``jax.tree_*``. When used
-  with ``tree.*`` it has similar performance to ``dict``.
+  Warning: this type is only efficient when used with ``jax.tree_util.tree_*``.
+  When used with ``tree.*`` it has similar performance to ``dict``.
 
   Note that to prevent common errors immutable shims are returned for any
   nested mappings.
@@ -196,14 +195,14 @@ class FlatMap(Mapping[K, V]):
       mapping = None
 
       # When unflattening we cannot assume that the leaves are not pytrees (for
-      # example: `jax.tree_map(list, my_map)` would pass a list of lists in
-      # as leaves).
+      # example: `jax.tree.map(list, my_map)` would pass a list of
+      # lists in as leaves).
       if not jax.tree_util.all_leaves(leaves):
-        mapping = jax.tree_unflatten(structure, leaves)
-        leaves, structure = jax.tree_flatten(mapping)
+        mapping = jax.tree.unflatten(structure, leaves)
+        leaves, structure = jax.tree.flatten(mapping)
     else:
       mapping = dict(*args, **kwargs)
-      leaves, structure = jax.tree_flatten(mapping)
+      leaves, structure = jax.tree.flatten(mapping)
 
     self._structure = structure
     self._leaves = tuple(leaves)
@@ -211,7 +210,7 @@ class FlatMap(Mapping[K, V]):
 
   def _to_mapping(self) -> Mapping[K, V]:
     if self._mapping is None:
-      self._mapping = jax.tree_unflatten(self._structure, self._leaves)
+      self._mapping = jax.tree.unflatten(self._structure, self._leaves)
     return self._mapping
 
   def keys(self):
@@ -249,8 +248,8 @@ class FlatMap(Mapping[K, V]):
 
   def __str__(self):
     single_line = "{}({{{}}})".format(
-        type(self).__name__,
-        ", ".join("{!r}: {!r}".format(k, v) for k, v in self.items()))
+        type(self).__name__, ", ".join(f"{k!r}: {v!r}" for k, v in self.items())
+    )
     if len(single_line) <= 80:
       return single_line
 
@@ -278,7 +277,7 @@ jax.tree_util.register_pytree_node(
 # This is only needed because some naughty people reach in to Haiku internals
 # and use `isinstance(x, haiku._src.data_structures.FlatMapping` (which was
 # renamed to FlatMap).
-# TODO(tomhennigan): If to_immutable_dict is remove this metaclass can go too.
+# TODO(tomhennigan): If to_immutable_dict is removed this metaclass can go too.
 class FlatMappingMeta(type(FlatMap)):
 
   def __instancecheck__(cls, instance) -> bool:
@@ -289,7 +288,10 @@ class FlatMapping(FlatMap, metaclass=FlatMappingMeta):
   """Only called from old checkpoints."""
 
   def __new__(cls, data):
-    return to_haiku_dict(data)
+    if config.get_config().restore_flatmap:
+      return to_immutable_dict(data)
+    else:
+      return to_haiku_dict(data)
 
   def __init__(self, *args, **kwargs):  # pylint: disable=super-init-not-called
     del args, kwargs
@@ -329,7 +331,7 @@ class frozendict(Mapping[K, V]):  # pylint: disable=invalid-name
     raise AttributeError(
         f"x.{key} is not supported on frozendict, use x['{key}'] instead.")
 
-  def get(self, key: K, default: Optional[T] = None) -> Union[V, Optional[T]]:
+  def get(self, key: K, default: T | None = None) -> V | T | None:
     return self._storage.get(key, default)
 
   def __getitem__(self, key: K) -> V:
@@ -338,7 +340,8 @@ class frozendict(Mapping[K, V]):  # pylint: disable=invalid-name
   def __repr__(self):
     single_line = "{}({{{}}})".format(
         type(self).__name__,
-        ", ".join("{!r}: {!r}".format(k, self._storage[k]) for k in self._keys))
+        ", ".join(f"{k!r}: {self._storage[k]!r}" for k in self._keys),
+    )
     if len(single_line) <= 80:
       return single_line
 
