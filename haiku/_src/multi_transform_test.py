@@ -13,17 +13,24 @@
 # limitations under the License.
 # ==============================================================================
 """Tests for haiku._src.multi_transform."""
+import inspect
 
 from absl.testing import absltest
 from absl.testing import parameterized
 from haiku._src import base
 from haiku._src import multi_transform
+from haiku._src import transform
+from haiku._src import typing
 import jax
 import jax.numpy as jnp
 import numpy as np
 
+PRNGKey = typing.PRNGKey
+State = typing.State
+Params = typing.Params
 
-def _assert_arrays_equal(x: jnp.DeviceArray, y: jnp.DeviceArray) -> None:
+
+def _assert_arrays_equal(x: jax.Array, y: jax.Array) -> None:
   np.testing.assert_almost_equal(np.array(x), np.array(y), decimal=5)
 
 
@@ -92,6 +99,77 @@ class MultiTransformTest(parameterized.TestCase):
     self.assertEqual(state_in, {'~': {'s': 0}})
     _, state_out = f.apply({}, state_in, None)
     self.assertEqual(state_out, {'~': {'s': 1}})
+
+  def test_without_apply_rng_multi_transform(self):
+    def net(name):
+      def f(x):
+        p = base.get_parameter(name, [], init=jnp.zeros)
+        return p+x
+      return f
+
+    def mod():
+      one = net(name='one')
+      two = net(name='two')
+      def init(x):
+        z = one(x)
+        return two(z)
+      return init, (one, two)
+
+    f = multi_transform.without_apply_rng(
+        multi_transform.multi_transform_with_state(mod))
+    self.assertIsInstance(f, multi_transform.MultiTransformedWithState)
+    params, state = f.init(None, jnp.ones(()))
+    f.apply[0](params, state, jnp.ones(()))
+    f.apply[1](params, state, jnp.ones(()))
+
+    f = multi_transform.without_apply_rng(multi_transform.multi_transform(mod))
+    self.assertIsInstance(f, multi_transform.MultiTransformed)
+    params = f.init(None, jnp.ones(()))
+    f.apply[0](params, jnp.ones(()))
+    f.apply[1](params, jnp.ones(()))
+
+  def test_signature_without_apply_rng_transform_with_state(self):
+    @multi_transform.without_apply_rng
+    @transform.transform_with_state
+    def f(pos, key=37) -> int:
+      del pos, key
+      return 2
+
+    def expected_f_init(
+        rng: PRNGKey | int | None, pos, key=37
+    ) -> tuple[Params, State]:
+      del rng, pos, key
+      raise NotImplementedError
+
+    def expected_f_apply(
+        params: Params | None, state: State | None, pos, key=37
+    ) -> tuple[int, State]:
+      del params, state, pos, key
+      raise NotImplementedError
+
+    self.assertEqual(
+        inspect.signature(f.init), inspect.signature(expected_f_init))
+    self.assertEqual(
+        inspect.signature(f.apply), inspect.signature(expected_f_apply))
+
+  def test_signature_without_apply_rng_transform(self):
+    @multi_transform.without_apply_rng
+    @transform.transform
+    def f(pos, *, key: int = 37) -> int:
+      del pos, key
+      return 2
+    def expected_f_init(rng: PRNGKey | int | None,
+                        pos, *, key: int = 37) -> Params:
+      del rng, pos, key
+      raise NotImplementedError
+    def expected_f_apply(
+        params: Params | None, pos, *, key: int = 37) -> int:
+      del params, pos, key
+      raise NotImplementedError
+    self.assertEqual(
+        inspect.signature(f.init), inspect.signature(expected_f_init))
+    self.assertEqual(
+        inspect.signature(f.apply), inspect.signature(expected_f_apply))
 
 
 # Example custom pytree (a dict where `x.a` behaves like `x['a']`).

@@ -14,9 +14,12 @@
 # ==============================================================================
 """Haiku types."""
 
+import abc
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 import typing
-from typing import Any, Callable, Mapping, Sequence
-import jax.numpy as jnp
+from typing import Any, Protocol, runtime_checkable
+
+import jax
 
 # pytype: disable=module-attr
 try:
@@ -26,9 +29,61 @@ except AttributeError:
   Module = Any
 # pytype: enable=module-attr
 
-Initializer = Callable[[Sequence[int], Any], jnp.ndarray]
-Params = Mapping[str, Mapping[str, jnp.ndarray]]
-State = Mapping[str, Mapping[str, jnp.ndarray]]
+Initializer = Callable[[Sequence[int], Any], jax.Array]
+Params = Mapping[str, Mapping[str, jax.Array]]
+MutableParams = MutableMapping[str, MutableMapping[str, jax.Array]]
+State = Mapping[str, Mapping[str, jax.Array]]
+MutableState = MutableMapping[str, MutableMapping[str, jax.Array]]
 
 # Missing JAX types.
-PRNGKey = jnp.ndarray  # pylint: disable=invalid-name
+PRNGKey = jax.Array  # pylint: disable=invalid-name
+
+
+class LiftingModuleType:
+  """Parent type of lift.LiftingModule, added here to solve circular dependency."""
+
+
+class StrictProtocol(Protocol):
+
+  def __init_subclass__(cls, **kwargs):
+    super().__init_subclass__(**kwargs)
+    if Protocol not in cls.__bases__:
+      base_names = ", ".join(b.__name__ for b in cls.__bases__)
+      raise TypeError(
+          f"{cls.__name__} is a Protocol and should not be subclassed by "
+          "a non-Protocol type. If you intended your subclass to be a "
+          "protocol then you need to explicitly additionally extend "
+          f"Protocol: `class {cls.__name__}({base_names}, Protocol)`.")
+
+
+@runtime_checkable
+class ModuleProtocol(StrictProtocol, Protocol):
+  """Protocol for Module like types."""
+
+  name: str
+  module_name: str
+
+  @abc.abstractmethod
+  def params_dict(self) -> Mapping[str, jax.Array]:
+    raise NotImplementedError
+
+  @abc.abstractmethod
+  def state_dict(self) -> Mapping[str, jax.Array]:
+    raise NotImplementedError
+
+
+@runtime_checkable
+class SupportsCall(ModuleProtocol, Protocol):
+  """Protocol for Module like types that are Callable.
+
+  Being a protocol means you don't need to explicitly extend this type in order
+  to support instance checks with it. For example, :class:`Linear` only extends
+  :class:`Module`, however since it conforms (e.g. implements ``__call__``) to
+  this protocol you can instance check using it::
+
+  >>> assert isinstance(hk.Linear(1), hk.SupportsCall)
+  """
+
+  @abc.abstractmethod
+  def __call__(self, *args, **kwargs):
+    raise NotImplementedError

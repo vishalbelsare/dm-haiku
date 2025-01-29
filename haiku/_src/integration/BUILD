@@ -1,6 +1,9 @@
 load("//haiku/_src:build_defs.bzl", "hk_py_binary", "hk_py_library", "hk_py_test")
 
-package(default_visibility = ["//visibility:private"])
+package(
+    default_applicable_licenses = ["//haiku:license"],
+    default_visibility = ["//visibility:private"],
+)
 
 licenses(["notice"])
 
@@ -68,6 +71,7 @@ hk_py_test(
         # pip: absl/testing:absltest
         # pip: absl/testing:parameterized
         "//haiku",
+        "//haiku/_src:stateful",
         "//haiku/_src:test_utils",
         "//haiku/_src:typing",
         # pip: jax
@@ -86,6 +90,7 @@ hk_py_test(
         # pip: absl/testing:absltest
         # pip: absl/testing:parameterized
         # pip: chex
+        # pip: flax
         "//haiku",
         "//haiku/_src:test_utils",
         # pip: jax
@@ -262,6 +267,8 @@ hk_py_test(
     name = "jax2tf_test",
     timeout = "long",
     srcs = ["jax2tf_test.py"],
+    # TODO(necula): fails under native serialiation (runs CPU code on TPU).
+    env = {"TF_XLA_FLAGS": "--tf_xla_call_module_disabled_checks=platform"},
     shard_count = 50,
     deps = [
         ":descriptors",
@@ -273,5 +280,33 @@ hk_py_test(
         # pip: jax/experimental/jax2tf
         # pip: numpy
         # pip: tensorflow
+    ],
+)
+
+hk_py_test(
+    name = "typing_test",
+    srcs = ["typing_test.py"],
+    gpu = False,
+    tpu = False,
+    deps = [
+        ":descriptors",
+        # pip: absl/testing:absltest
+        # pip: absl/testing:parameterized
+        "//haiku",
+        "//haiku/_src:test_utils",
+    ],
+)
+
+hk_py_test(
+    name = "jaxpr_info_test",
+    srcs = ["jaxpr_info_test.py"],
+    shard_count = 50,
+    deps = [
+        ":descriptors",
+        # pip: absl/testing:absltest
+        # pip: absl/testing:parameterized
+        "//haiku",
+        "//haiku/_src:test_utils",
+        # pip: jax
     ],
 )

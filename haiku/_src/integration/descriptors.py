@@ -14,14 +14,15 @@
 # ==============================================================================
 """Module descriptors programatically describe how to use modules."""
 
-from typing import Any, Callable, NamedTuple, Type, Sequence
+from collections.abc import Callable, Sequence
+from typing import Any, NamedTuple
 
 import haiku as hk
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-ModuleFn = Callable[[], Callable[[jnp.ndarray], jnp.ndarray]]
+ModuleFn = Callable[[], Callable[[jax.Array], jax.Array]]
 
 
 class Wrapped(hk.Module):
@@ -33,7 +34,7 @@ class Wrapped(hk.Module):
 
 class Training(Wrapped):
 
-  def __call__(self, x: jnp.ndarray):
+  def __call__(self, x: jax.Array):
     return self.wrapped(x, is_training=True)
 
 
@@ -43,7 +44,7 @@ class MultiInput(Wrapped):
     super().__init__(wrapped)
     self.num_inputs = num_inputs
 
-  def __call__(self, x: jnp.ndarray):
+  def __call__(self, x: jax.Array):
     inputs = [x for _ in range(self.num_inputs)]
     return self.wrapped(*inputs)
 
@@ -55,10 +56,11 @@ class Recurrent(Wrapped):
     super().__init__(module)
     self.unroller = unroller
 
-  def __call__(self, x: jnp.ndarray):
-    initial_state = jax.tree_map(
+  def __call__(self, x: jax.Array):
+    initial_state = jax.tree.map(
         lambda v: v.astype(x.dtype),
-        self.wrapped.initial_state(batch_size=x.shape[0]))
+        self.wrapped.initial_state(batch_size=x.shape[0]),
+    )
     x = jnp.expand_dims(x, axis=0)
     return self.unroller(self.wrapped, x, initial_state)
 
@@ -156,7 +158,7 @@ BATCH_MODULES = (
         shape=(BATCH_SIZE, 4, 4, 10)),
     ModuleDescriptor(
         name="LayerNorm",
-        create=lambda: hk.LayerNorm(1, True, True),
+        create=lambda: hk.LayerNorm(1, True, True, param_axis=-1),
         shape=(BATCH_SIZE, 3, 2)),
     ModuleDescriptor(
         name="MultiHeadAttention",
@@ -284,7 +286,7 @@ def unroll_descriptors(descriptors, unroller):
   """Returns `Recurrent` wrapped descriptors with the given unroller applied."""
   out = []
   for name, create, shape, dtype in descriptors:
-    name = "Recurrent({}, {})".format(name, unroller.__name__)
+    name = f"Recurrent({name}, {unroller.__name__})"
     out.append(
         ModuleDescriptor(name=name,
                          create=recurrent_factory(create, unroller),
@@ -293,7 +295,7 @@ def unroll_descriptors(descriptors, unroller):
   return tuple(out)
 
 
-def module_type(module_fn: ModuleFn) -> Type[hk.Module]:
+def module_type(module_fn: ModuleFn) -> type[hk.Module]:
   f = hk.transform_with_state(lambda: type(unwrap(module_fn())))
   return f.apply(*f.init(jax.random.PRNGKey(42)), None)[0]
 
@@ -312,7 +314,86 @@ RECURRENT_MODULES = (
     unroll_descriptors(RNN_CORES, hk.dynamic_unroll) +
     unroll_descriptors(RNN_CORES, hk.static_unroll))
 
+STATEFUL_MODULES = (
+    ModuleDescriptor(
+        name="nets.VectorQuantizerEMA",
+        create=lambda: Training(hk.nets.VectorQuantizerEMA(64, 512, 0.25, 0.9)),
+        shape=(BATCH_SIZE, 64)),
+    ModuleDescriptor(
+        name="SpectralNorm",
+        create=lambda: hk.SpectralNorm(),
+        shape=(BATCH_SIZE, 3, 2)),
+    ModuleDescriptor(
+        name="BatchNorm",
+        create=lambda: Training(hk.BatchNorm(True, True, 0.9)),
+        shape=(BATCH_SIZE, 2, 2, 3)),
+)
+
 ALL_MODULES = OPTIONAL_BATCH_MODULES + BATCH_MODULES + RECURRENT_MODULES
+
+# Modules that do not use get_parameter
+NO_PARAM_MODULES = (
+    ModuleDescriptor(
+        name="Flatten",
+        create=lambda: hk.Flatten(),
+        shape=(BATCH_SIZE, 3, 3, 3)),
+    ModuleDescriptor(
+        name="SpectralNorm",
+        create=lambda: hk.SpectralNorm(),
+        shape=(BATCH_SIZE, 3, 2)),
+    ModuleDescriptor(
+        name="Sequential",
+        create=lambda: hk.Sequential([]),
+        shape=(BATCH_SIZE, 2, 2)),
+)
+
+# Modules that do not use "hk.next_rng_key"
+NO_NEXT_RNG_KEY_MODULES = (
+    ModuleDescriptor(
+        name="Sequential",
+        create=lambda: hk.Sequential([]),
+        shape=(BATCH_SIZE, 2, 2)),
+    ModuleDescriptor(
+        name="RMSNorm",
+        create=lambda: hk.RMSNorm(1),
+        shape=(BATCH_SIZE, 3, 2)),
+    ModuleDescriptor(
+        name="InstanceNorm",
+        create=lambda: hk.InstanceNorm(True, True),
+        shape=(BATCH_SIZE, 3, 2)),
+    ModuleDescriptor(
+        name="GroupNorm",
+        create=lambda: hk.GroupNorm(5),
+        shape=(BATCH_SIZE, 4, 4, 10)),
+    ModuleDescriptor(
+        name="LayerNorm",
+        create=lambda: hk.LayerNorm(1, True, True, param_axis=-1),
+        shape=(BATCH_SIZE, 3, 2)),
+    ModuleDescriptor(
+        name="BatchNorm",
+        create=lambda: Training(hk.BatchNorm(True, True, 0.9)),
+        shape=(BATCH_SIZE, 2, 2, 3)),
+    ModuleDescriptor(
+        name="Bias",
+        create=lambda: hk.Bias(),
+        shape=(BATCH_SIZE, 3, 3, 3)),
+    ModuleDescriptor(
+        name="Flatten",
+        create=lambda: hk.Flatten(),
+        shape=(BATCH_SIZE, 3, 3, 3)),
+) + RECURRENT_MODULES
+
+NO_NEXT_RNG_KEY_NAMES = [d.name for d in NO_NEXT_RNG_KEY_MODULES]
+NEXT_RNG_KEY_MODULES = [
+    d for d in ALL_MODULES if d.name not in NO_NEXT_RNG_KEY_NAMES
+]
+
+NOT_ONLY_PARAMS_MODULES = set(NO_PARAM_MODULES) | set(STATEFUL_MODULES) | set(
+    RECURRENT_MODULES)
+NOT_ONLY_PARAMS_NAMES = [d.name for d in NOT_ONLY_PARAMS_MODULES]
+ONLY_PARAMS_MODULES = [
+    d for d in ALL_MODULES if d.name not in NOT_ONLY_PARAMS_NAMES
+]
 
 IGNORED_MODULES = {
     # Stateless or abstract.

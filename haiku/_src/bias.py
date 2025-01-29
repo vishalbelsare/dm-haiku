@@ -14,20 +14,23 @@
 # ==============================================================================
 """Bias module."""
 
-import types
-from typing import Optional, Sequence, Union
+from collections.abc import Sequence
 
 from haiku._src import base
 from haiku._src import initializers
 from haiku._src import module
 from haiku._src import utils
+import jax
 import jax.numpy as jnp
 
-# If you are forking replace this block with `import haiku as hk`.
-hk = types.ModuleType("haiku")
-hk.get_parameter = base.get_parameter
-hk.initializers = initializers
-hk.Module = module.Module
+
+# If you are forking replace this with `import haiku as hk`.
+# pylint: disable=invalid-name
+class hk:
+  get_parameter = base.get_parameter
+  initializers = initializers
+  Module = module.Module
+# pylint: enable=invalid-name
 del base, module
 
 
@@ -72,10 +75,10 @@ class Bias(hk.Module):
 
   def __init__(
       self,
-      output_size: Optional[Sequence[int]] = None,
-      bias_dims: Optional[Sequence[int]] = None,
-      b_init: Optional[hk.initializers.Initializer] = None,
-      name: Optional[str] = None,
+      output_size: Sequence[int] | None = None,
+      bias_dims: Sequence[int] | None = None,
+      b_init: hk.initializers.Initializer | None = None,
+      name: str | None = None,
   ):
     """Constructs a ``Bias`` module that supports broadcasting.
 
@@ -98,9 +101,9 @@ class Bias(hk.Module):
 
   def __call__(
       self,
-      inputs: jnp.ndarray,
-      multiplier: Union[float, jnp.ndarray] = None,
-  ) -> jnp.ndarray:
+      inputs: jax.Array,
+      multiplier: float | jax.Array | None = None,
+  ) -> jax.Array:
     """Adds bias to ``inputs`` and optionally multiplies by ``multiplier``.
 
     Args:
@@ -117,7 +120,9 @@ class Bias(hk.Module):
     utils.assert_minimum_rank(inputs, 2)
     if self.output_size is not None and self.output_size != inputs.shape[1:]:
       raise ValueError(
-          f"Input shape must be {(-1,) + self.output_size} not {inputs.shape}")
+          f"Input shape must be {(-1,) + tuple(self.output_size)} not"
+          f" {inputs.shape}"
+      )
 
     self.bias_shape = calculate_bias_shape(inputs.shape, self.bias_dims)
     self.input_size = inputs.shape[1:]

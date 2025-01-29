@@ -55,7 +55,7 @@ class VqvaeTest(parameterized.TestCase):
     # Output shape is correct
     self.assertEqual(vq_output['quantize'].shape, inputs.shape)
 
-    vq_output_np = jax.tree_map(lambda t: t, vq_output)
+    vq_output_np = jax.tree.map(lambda t: t, vq_output)
     embeddings_np = vqvae_module.embeddings
 
     self.assertEqual(embeddings_np.shape,
@@ -91,7 +91,7 @@ class VqvaeTest(parameterized.TestCase):
   def testShapeChecking(self, constructor, kwargs):
     vqvae_module = constructor(**kwargs)
     wrong_shape_input = np.random.randn(100, kwargs['embedding_dim'] * 2)
-    with self.assertRaisesRegex(TypeError, 'total size must be unchanged'):
+    with self.assertRaises((ValueError, TypeError)):
       vqvae_module(
           jnp.array(wrong_shape_input.astype(np.float32)), is_training=False)
 
@@ -180,7 +180,7 @@ class VqvaeTest(parameterized.TestCase):
           functools.partial(my_function, axis_name=axis_name))
 
       rng = jax.random.PRNGKey(42)
-      rng = jnp.broadcast_to(rng, (jax.local_device_count(), rng.shape[0]))
+      rng = jnp.broadcast_to(rng, (jax.local_device_count(), *rng.shape))
 
       params, state = jax.pmap(
           vqvae_f.init, axis_name='i')(rng, inputs)

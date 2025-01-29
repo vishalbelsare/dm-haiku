@@ -1,6 +1,12 @@
 load("//haiku/_src:build_defs.bzl", "hk_py_library", "hk_py_test")
 
-package(default_visibility = ["//haiku:__subpackages__"])
+package(
+    default_applicable_licenses = ["//haiku:license"],
+    default_visibility = [
+        "//learning/deepmind/jax/haiku/metadata:__subpackages__",
+        "//haiku:__subpackages__",
+    ],
+)
 
 licenses(["notice"])
 
@@ -26,12 +32,12 @@ hk_py_test(
     srcs = ["attention_test.py"],
     deps = [
         ":attention",
+        ":initializers",
         ":test_utils",
         ":transform",
         # pip: absl/testing:absltest
         # pip: absl/testing:parameterized
         # pip: jax
-        # pip: numpy
     ],
 )
 
@@ -39,22 +45,61 @@ hk_py_library(
     name = "base",
     srcs = ["base.py"],
     deps = [
+        ":config",
         ":data_structures",
         ":typing",
         # pip: jax
     ],
 )
 
-hk_py_test(
-    name = "base_test",
+hk_py_library(
+    name = "base_test_lib",
+    testonly = 1,
     srcs = ["base_test.py"],
     deps = [
         ":base",
+        ":config",
         ":test_utils",
         # pip: absl/testing:absltest
         # pip: absl/testing:parameterized
+        "//haiku",
         # pip: jax
         # pip: numpy
+    ],
+)
+
+hk_py_test(
+    name = "base_test",
+    srcs = ["base_test.py"],
+    deps = [":base_test_lib"],
+)
+
+# TODO(b/199564969): remove once we always enable_custom_prng
+hk_py_test(
+    name = "base_test_custom_prng",
+    srcs = ["base_test.py"],
+    env = {
+        "JAX_ENABLE_CUSTOM_PRNG": "true",
+    },
+    main = "base_test.py",
+    deps = [":base_test_lib"],
+)
+
+hk_py_library(
+    name = "config",
+    srcs = ["config.py"],
+)
+
+hk_py_test(
+    name = "config_test",
+    srcs = ["config_test.py"],
+    gpu = False,
+    tpu = False,
+    deps = [
+        ":config",
+        # pip: absl/testing:absltest
+        # pip: absl/testing:parameterized
+        # pip: jax
     ],
 )
 
@@ -75,12 +120,14 @@ hk_py_test(
     srcs = ["transform_test.py"],
     deps = [
         ":base",
-        ":data_structures",
+        ":multi_transform",
         ":test_utils",
         ":transform",
+        ":typing",
         # pip: absl/testing:absltest
         # pip: absl/testing:parameterized
         # pip: jax
+        # pip: tensorflow
     ],
 )
 
@@ -101,6 +148,8 @@ hk_py_test(
     deps = [
         ":base",
         ":multi_transform",
+        ":transform",
+        ":typing",
         # pip: absl/testing:absltest
         # pip: absl/testing:parameterized
         # pip: jax
@@ -138,11 +187,11 @@ hk_py_library(
     srcs = ["module.py"],
     deps = [
         ":base",
+        ":config",
         ":data_structures",
         ":stateful",
         ":utils",
         # pip: jax
-        # pip: typing_extensions
     ],
 )
 
@@ -151,13 +200,13 @@ hk_py_test(
     srcs = ["module_test.py"],
     deps = [
         ":base",
+        ":config",
         ":module",
         ":test_utils",
         ":transform",
         # pip: absl/testing:absltest
         # pip: absl/testing:parameterized
         # pip: jax
-        # pip: typing_extensions
     ],
 )
 
@@ -207,6 +256,26 @@ hk_py_test(
     name = "batch_norm_test",
     srcs = ["batch_norm_test.py"],
     deps = [
+        ":base",
+        ":batch_norm",
+        ":test_utils",
+        ":transform",
+        # pip: absl/testing:absltest
+        # pip: jax
+        # pip: numpy
+    ],
+)
+
+# TODO(b/199564969): remove once we always enable_custom_prng
+hk_py_test(
+    name = "batch_norm_test_custom_prng",
+    srcs = ["batch_norm_test.py"],
+    env = {
+        "JAX_ENABLE_CUSTOM_PRNG": "true",
+    },
+    main = "batch_norm_test.py",
+    deps = [
+        ":base",
         ":batch_norm",
         ":test_utils",
         ":transform",
@@ -277,7 +346,9 @@ hk_py_library(
         ":module",
         ":utils",
         # pip: jax
-        # pip: tree
+        # pip: jax:extend
+        # pip: jax/extend:core
+        # pip: tree  # build_cleaner: keep
     ],
 )
 
@@ -285,6 +356,7 @@ hk_py_test(
     name = "dot_test",
     srcs = ["dot_test.py"],
     deps = [
+        ":config",
         ":dot",
         ":module",
         ":stateful",
@@ -292,7 +364,6 @@ hk_py_test(
         # pip: absl/testing:absltest
         # pip: absl/testing:parameterized
         # pip: jax
-        # pip: mock
     ],
 )
 
@@ -333,6 +404,7 @@ hk_py_library(
         ":data_structures",
         ":module",
         ":transform",
+        ":typing",
     ],
 )
 
@@ -341,8 +413,11 @@ hk_py_test(
     srcs = ["lift_test.py"],
     deps = [
         ":base",
+        ":config",
         ":lift",
         ":module",
+        ":multi_transform",
+        ":stateful",
         ":test_utils",
         ":transform",
         # pip: absl/testing:absltest
@@ -423,6 +498,7 @@ hk_py_library(
     name = "data_structures",
     srcs = ["data_structures.py"],
     deps = [
+        ":config",
         ":utils",
         # pip: jax
     ],
@@ -434,7 +510,6 @@ hk_py_test(
     data = glob(["testdata/**"]),
     deps = [
         ":data_structures",
-        ":test_utils",
         # pip: absl/testing:absltest
         # pip: absl/testing:parameterized
         # pip: cloudpickle
@@ -490,6 +565,32 @@ hk_py_test(
     ],
 )
 
+hk_py_library(
+    name = "jaxpr_info",
+    srcs = ["jaxpr_info.py"],
+    deps = [
+        ":summarise",
+        # pip: jax
+        # pip: jax/extend:core
+    ],
+)
+
+hk_py_test(
+    name = "jaxpr_info_test",
+    srcs = ["jaxpr_info_test.py"],
+    deps = [
+        ":conv",
+        ":jaxpr_info",
+        ":module",
+        ":transform",
+        # pip: absl/logging
+        # pip: absl/testing:absltest
+        # pip: jax
+        # pip: jax/extend:core
+        # pip: numpy
+    ],
+)
+
 hk_py_test(
     name = "layer_norm_test",
     srcs = ["layer_norm_test.py"],
@@ -521,7 +622,6 @@ hk_py_library(
 hk_py_library(
     name = "layer_stack",
     srcs = ["layer_stack.py"],
-    srcs_version = "PY3",
     deps = [
         ":base",
         ":lift",
@@ -537,10 +637,13 @@ hk_py_test(
     deps = [
         ":base",
         ":basic",
+        ":config",
         ":initializers",
         ":layer_stack",
         ":module",
+        ":multi_transform",
         ":transform",
+        ":utils",
         # pip: absl/testing:absltest
         # pip: absl/testing:parameterized
         # pip: jax
@@ -567,6 +670,7 @@ hk_py_test(
     deps = [
         ":basic",
         ":moving_averages",
+        ":multi_transform",
         ":test_utils",
         ":transform",
         # pip: absl/testing:absltest
@@ -671,9 +775,21 @@ hk_py_library(
     name = "test_utils",
     srcs = ["test_utils.py"],
     deps = [
+        ":config",
         ":transform",
         # pip: absl/testing:parameterized
         # pip: chex
+        # pip: jax
+    ],
+)
+
+hk_py_test(
+    name = "test_utils_test",
+    srcs = ["test_utils_test.py"],
+    deps = [
+        ":test_utils",
+        # pip: absl/testing:absltest
+        # pip: absl/testing:parameterized
         # pip: jax
     ],
 )
@@ -698,6 +814,7 @@ hk_py_library(
         ":initializers",
         ":module",
         # pip: jax
+        # pip: numpy
     ],
 )
 
@@ -714,6 +831,8 @@ hk_py_library(
 hk_py_test(
     name = "reshape_test",
     srcs = ["reshape_test.py"],
+    # TODO(necula): fails under native serialiation (runs CPU code on TPU)..
+    env = {"TF_XLA_FLAGS": "--tf_xla_call_module_disabled_checks=platform"},
     deps = [
         ":reshape",
         ":test_utils",
@@ -721,6 +840,7 @@ hk_py_test(
         # pip: absl/testing:absltest
         # pip: absl/testing:parameterized
         # pip: jax
+        # pip: jax/experimental/jax2tf
         # pip: numpy
     ],
 )
@@ -739,6 +859,9 @@ hk_py_test(
     srcs = ["stateful_test.py"],
     deps = [
         ":base",
+        ":base_test_lib",
+        ":config",
+        ":initializers",
         ":module",
         ":stateful",
         ":test_utils",
@@ -746,6 +869,32 @@ hk_py_test(
         # pip: absl/testing:absltest
         # pip: absl/testing:parameterized
         # pip: jax
+        # pip: jax/extend:core
+        # pip: numpy
+    ],
+)
+
+# TODO(b/199564969): remove once we always enable_custom_prng
+hk_py_test(
+    name = "stateful_test_custom_prng",
+    srcs = ["stateful_test.py"],
+    env = {
+        "JAX_ENABLE_CUSTOM_PRNG": "true",
+    },
+    main = "stateful_test.py",
+    deps = [
+        ":base",
+        ":base_test_lib",
+        ":config",
+        ":initializers",
+        ":module",
+        ":stateful",
+        ":test_utils",
+        ":transform",
+        # pip: absl/testing:absltest
+        # pip: absl/testing:parameterized
+        # pip: jax
+        # pip: jax/extend:core
         # pip: numpy
     ],
 )
@@ -758,12 +907,24 @@ hk_py_library(
     ],
 )
 
+hk_py_test(
+    name = "typing_test",
+    srcs = ["typing_test.py"],
+    deps = [
+        ":module",
+        ":test_utils",
+        ":typing",
+        # pip: absl/testing:absltest
+        # pip: absl/testing:parameterized
+    ],
+)
+
 hk_py_library(
     name = "filtering",
     srcs = ["filtering.py"],
     deps = [
         ":data_structures",
-        ":typing",
+        ":utils",
         # pip: jax
     ],
 )
@@ -775,7 +936,6 @@ hk_py_test(
         ":basic",
         ":data_structures",
         ":filtering",
-        ":test_utils",
         ":transform",
         # pip: absl/testing:absltest
         # pip: absl/testing:parameterized
@@ -801,7 +961,9 @@ hk_py_test(
         ":random",
         ":transform",
         # pip: absl/testing:absltest
+        # pip: absl/testing:parameterized
         # pip: jax
+        # pip: jax:extend
         # pip: numpy
     ],
 )
@@ -809,10 +971,10 @@ hk_py_test(
 hk_py_library(
     name = "rms_norm",
     srcs = ["rms_norm.py"],
-    srcs_version = "PY3",
     deps = [
         ":base",
         ":initializers",
+        ":layer_norm",
         ":module",
         # pip: jax
     ],
@@ -821,8 +983,6 @@ hk_py_library(
 hk_py_test(
     name = "rms_norm_test",
     srcs = ["rms_norm_test.py"],
-    python_version = "PY3",
-    srcs_version = "PY3",
     deps = [
         ":initializers",
         ":rms_norm",
@@ -832,5 +992,69 @@ hk_py_test(
         # pip: absl/testing:parameterized
         # pip: jax
         # pip: numpy
+    ],
+)
+
+hk_py_library(
+    name = "deferred",
+    srcs = ["deferred.py"],
+    deps = [
+        ":base",
+        ":module",
+    ],
+)
+
+hk_py_test(
+    name = "deferred_test",
+    srcs = ["deferred_test.py"],
+    deps = [
+        ":deferred",
+        ":module",
+        ":test_utils",
+        # pip: absl/testing:absltest
+        # pip: absl/testing:parameterized
+        # pip: jax
+    ],
+)
+
+hk_py_library(
+    name = "eval_shape",
+    srcs = ["eval_shape.py"],
+    deps = [
+        ":base",
+        ":basic",
+        ":stateful",
+        # pip: jax
+    ],
+)
+
+hk_py_test(
+    name = "eval_shape_test",
+    srcs = ["eval_shape_test.py"],
+    deps = [
+        ":basic",
+        ":eval_shape",
+        ":stateful",
+        ":test_utils",
+        ":transform",
+        # pip: absl/testing:absltest
+        # pip: absl/testing:parameterized
+        # pip: jax
+    ],
+)
+
+hk_py_library(
+    name = "no_flax",
+    srcs = ["no_flax.py"],
+)
+
+hk_py_test(
+    name = "no_flax_test",
+    srcs = ["no_flax_test.py"],
+    deps = [
+        ":no_flax",
+        # pip: absl/testing:absltest
+        # pip: flax:core
+        "//haiku",
     ],
 )

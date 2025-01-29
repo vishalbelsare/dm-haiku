@@ -14,51 +14,56 @@
 # ==============================================================================
 """Padding module for Haiku."""
 
-import collections
-import types
-from typing import Any, Callable, Sequence, Union, Tuple
+from collections import abc
+from collections.abc import Callable, Sequence
+import typing
+from typing import Any
 
 from haiku._src import utils
 
-PadFn = Callable[[int], Tuple[int, int]]
-
-hk = types.ModuleType("haiku")
-hk.pad = types.ModuleType("haiku.pad")
-hk.pad.PadFn = PadFn
+PadFn = Callable[[int], tuple[int, int]]
 
 
-def valid(effective_kernel_size: int) -> Tuple[int, int]:
+# If you are forking replace this block with `import haiku as hk`.
+# pylint: disable=invalid-name
+class hk:
+  class pad:
+    PadFn = PadFn
+# pylint: enable=invalid-name
+
+
+def valid(effective_kernel_size: int) -> tuple[int, int]:
   """No padding."""
   del effective_kernel_size
   return (0, 0)
 
 
-def same(effective_kernel_size: int) -> Tuple[int, int]:
+def same(effective_kernel_size: int) -> tuple[int, int]:
   """Pads such that the output size matches input size for stride=1."""
   return ((effective_kernel_size - 1) // 2, effective_kernel_size // 2)
 
 
-def full(effective_kernel_size: int) -> Tuple[int, int]:
+def full(effective_kernel_size: int) -> tuple[int, int]:
   """Maximal padding whilst not convolving over just padded elements."""
   return (effective_kernel_size - 1, effective_kernel_size - 1)
 
 
-def causal(effective_kernel_size: int) -> Tuple[int, int]:
+def causal(effective_kernel_size: int) -> tuple[int, int]:
   """Pre-padding such that output has no dependence on the future."""
   return (effective_kernel_size - 1, 0)
 
 
-def reverse_causal(effective_kernel_size: int) -> Tuple[int, int]:
+def reverse_causal(effective_kernel_size: int) -> tuple[int, int]:
   """Post-padding such that output has no dependence on the past."""
   return (0, effective_kernel_size - 1)
 
 
 def create_from_padfn(
-    padding: Union[hk.pad.PadFn, Sequence[hk.pad.PadFn]],
-    kernel: Union[int, Sequence[int]],
-    rate: Union[int, Sequence[int]],
+    padding: hk.pad.PadFn | Sequence[hk.pad.PadFn],  # pylint: disable=g-bare-generic
+    kernel: int | Sequence[int],
+    rate: int | Sequence[int],
     n: int,
-) -> Sequence[Tuple[int, int]]:
+) -> Sequence[tuple[int, int]]:
   """Generates the padding required for a given padding algorithm.
 
   Args:
@@ -92,9 +97,9 @@ def create_from_padfn(
 
 
 def create_from_tuple(
-    padding: Union[Tuple[int, int], Sequence[Tuple[int, int]]],
+    padding: tuple[int, int] | Sequence[tuple[int, int]],
     n: int,
-) -> Sequence[Tuple[int, int]]:
+) -> Sequence[tuple[int, int]]:
   """Create a padding tuple using partially specified padding tuple."""
   assert padding, "Padding must not be empty."
   if isinstance(padding[0], int):
@@ -105,12 +110,12 @@ def create_from_tuple(
     raise TypeError(
         f"Padding {padding} must be a Tuple[int, int] or sequence of length 1"
         f" or sequence of length {n}.")
-  padding = tuple(padding)  # type: Sequence[Tuple[int, int]]  # pytype: disable=annotation-type-mismatch
+  padding = typing.cast(Sequence[tuple[int, int]], tuple(padding))
   return padding
 
 
-def is_padfn(padding: Union[hk.pad.PadFn, Sequence[hk.pad.PadFn], Any]) -> bool:
+def is_padfn(padding: hk.pad.PadFn | Sequence[hk.pad.PadFn] | Any) -> bool:  # pylint: disable=g-bare-generic
   """Tests whether the given argument is a single or sequence of PadFns."""
-  if isinstance(padding, collections.Sequence):
+  if isinstance(padding, abc.Sequence):
     padding = padding[0]
   return callable(padding)

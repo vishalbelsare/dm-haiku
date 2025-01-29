@@ -120,7 +120,7 @@ class AtariDeepTorso(hk.Module):
           padding='SAME',
       )
       for j in range(num_blocks):
-        block = ResidualBlock(num_channels, name='residual_{}_{}'.format(i, j))
+        block = ResidualBlock(num_channels, name=f'residual_{i}_{j}')
         torso_out = block(torso_out)
 
     torso_out = jax.nn.relu(torso_out)
@@ -144,7 +144,7 @@ class AtariNet(hk.RNNCore):
     return self._core.initial_state(batch_size)
 
   def __call__(self, x: dm_env.TimeStep, state):
-    x = jax.tree_map(lambda t: t[None, ...], x)
+    x = jax.tree.map(lambda t: t[None, ...], x)
     return self.unroll(x, state)
 
   def unroll(self, x, state):

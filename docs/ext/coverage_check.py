@@ -14,7 +14,8 @@
 # ==============================================================================
 """Asserts all public symbols are covered in the docs."""
 
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 import haiku as hk
 from haiku._src import test_utils
@@ -55,6 +56,11 @@ class HaikuCoverageCheck(builders.Builder):
   def finish(self) -> None:
     documented_objects = frozenset(self.env.domaindata["py"]["objects"])
     undocumented_objects = haiku_public_symbols() - documented_objects
+    if undocumented_objects:
+      # Remove symbols that appear to have moved out of experimental.
+      for obj in tuple(undocumented_objects):
+        if obj.replace("haiku.experimental", "haiku") in documented_objects:
+          undocumented_objects.remove(obj)
     if undocumented_objects:
       undocumented_objects = tuple(sorted(undocumented_objects))
       raise errors.SphinxError(

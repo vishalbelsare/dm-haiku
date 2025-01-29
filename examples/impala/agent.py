@@ -14,8 +14,9 @@
 # ==============================================================================
 """A stateless agent interface."""
 import collections
+from collections.abc import Callable
 import functools
-from typing import Any, Callable, Optional, Tuple
+from typing import Any
 
 import dm_env
 import haiku as hk
@@ -56,19 +57,20 @@ class Agent:
             lambda batch_size: net_factory().initial_state(batch_size)))
 
     self._init_fn, self._apply_fn = hk.without_apply_rng(
-        hk.transform(lambda obs, state: net_factory().unroll(obs, state)))
+        hk.transform(lambda obs, state: net_factory().unroll(obs, state)))  # pytype: disable=attribute-error
 
   @functools.partial(jax.jit, static_argnums=0)
   def initial_params(self, rng_key):
     """Initializes the agent params given the RNG key."""
-    dummy_inputs = jax.tree_map(lambda t: np.zeros(t.shape, t.dtype),
-                                self._obs_spec)
+    dummy_inputs = jax.tree.map(
+        lambda t: np.zeros(t.shape, t.dtype), self._obs_spec
+    )
     dummy_inputs = util.preprocess_step(dm_env.restart(dummy_inputs))
-    dummy_inputs = jax.tree_map(lambda t: t[None, None, ...], dummy_inputs)
+    dummy_inputs = jax.tree.map(lambda t: t[None, None, ...], dummy_inputs)
     return self._init_fn(rng_key, dummy_inputs, self.initial_state(1))
 
   @functools.partial(jax.jit, static_argnums=(0, 1))
-  def initial_state(self, batch_size: Optional[int]):
+  def initial_state(self, batch_size: int | None):
     """Returns agent initial state."""
     # We expect that generating the initial_state does not require parameters.
     return self._initial_state_apply_fn(None, batch_size)
@@ -80,16 +82,16 @@ class Agent:
       params: hk.Params,
       timestep: dm_env.TimeStep,
       state: Nest,
-  ) -> Tuple[AgentOutput, Nest]:
+  ) -> tuple[AgentOutput, Nest]:
     """For a given single-step, unbatched timestep, output the chosen action."""
     # Pad timestep, state to be [T, B, ...] and [B, ...] respectively.
-    timestep = jax.tree_map(lambda t: t[None, None, ...], timestep)
-    state = jax.tree_map(lambda t: t[None, ...], state)
+    timestep = jax.tree.map(lambda t: t[None, None, ...], timestep)
+    state = jax.tree.map(lambda t: t[None, ...], state)
 
     net_out, next_state = self._apply_fn(params, timestep, state)
     # Remove the padding from above.
-    net_out = jax.tree_map(lambda t: jnp.squeeze(t, axis=(0, 1)), net_out)
-    next_state = jax.tree_map(lambda t: jnp.squeeze(t, axis=0), next_state)
+    net_out = jax.tree.map(lambda t: jnp.squeeze(t, axis=(0, 1)), net_out)
+    next_state = jax.tree.map(lambda t: jnp.squeeze(t, axis=0), next_state)
     # Sample an action and return.
     action = hk.multinomial(rng_key, net_out.policy_logits, num_samples=1)
     action = jnp.squeeze(action, axis=-1)

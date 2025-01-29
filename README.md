@@ -13,6 +13,31 @@
 ![docs](https://readthedocs.org/projects/dm-haiku/badge/?version=latest)
 ![pypi](https://img.shields.io/pypi/v/dm-haiku)
 
+> [!IMPORTANT]
+> 📣 **As of July 2023 [Google DeepMind] recommends that new projects adopt
+> [Flax] instead of Haiku. [Flax] is a neural network library originally
+> developed by [Google Brain] and now by [Google DeepMind].** 📣
+>
+> At the time of writing [Flax] has superset of the features available in Haiku,
+> a [larger](https://github.com/google/flax/graphs/contributors) and
+> [more active](https://github.com/google/flax/activity) development team and
+> more adoption with users outside of Alphabet. [Flax] has
+> [more extensive documentation](https://flax.readthedocs.io/),
+> [examples](https://github.com/huggingface/transformers/tree/main/examples/flax)
+> and an [active community](https://huggingface.co/flax-community) creating end
+> to end examples.
+>
+> Haiku will remain best-effort supported, however the project will enter
+> [maintenance mode](https://en.wikipedia.org/wiki/Maintenance_mode), meaning
+> that development efforts will be focussed on bug fixes and compatibility with
+> new releases of JAX.
+>
+> New releases will be made to keep Haiku working with newer versions of Python
+> and [JAX], however we will not be adding (or accepting PRs for) new features.
+>
+> We have significant usage of Haiku internally at [Google DeepMind] and
+> currently plan to support Haiku in this mode indefinitely.
+
 ## What is Haiku?
 
 > Haiku is a tool<br>
@@ -129,7 +154,7 @@ def update_rule(param, update):
 
 for images, labels in input_dataset:
   grads = jax.grad(loss_fn_t.apply)(params, images, labels)
-  params = jax.tree_multimap(update_rule, params, grads)
+  params = jax.tree.map(update_rule, params, grads)
 ```
 
 The core of Haiku is `hk.transform`. The `transform` function allows you to
@@ -148,7 +173,7 @@ function, keeping track of any parameters requested through `hk.get_parameter`
 (called by e.g. `hk.Linear`) and returning them to you.
 
 The `params` object returned is a nested data structure of all the
-parameters in your network, designed for your to inspect and manipulate. 
+parameters in your network, designed for you to inspect and manipulate. 
 Concretely, it is a mapping of module name to module parameters, where a module
 parameter is a mapping of parameter name to parameter value. For example:
 
@@ -193,9 +218,9 @@ grads = jax.grad(loss_fn_t.apply)(params, images, labels)
 ### Training
 
 The training loop in this example is very simple. One detail to note is the use
-of `jax.tree_multimap` to apply the `sgd` function across all matching
-entries in `params` and `grads`. The result has the same structure as the
-previous `params` and can again be used with `apply`.
+of `jax.tree.map` to apply the `sgd` function across all matching entries in
+`params` and `grads`. The result has the same structure as the previous `params`
+and can again be used with `apply`.
 
 
 ## Installation<a id="installation"></a>
@@ -205,7 +230,7 @@ Haiku is written in pure Python, but depends on C++ code via JAX.
 Because JAX installation is different depending on your CUDA version, Haiku does
 not list JAX as a dependency in `requirements.txt`.
 
-First, follow [these instructions](https://github.com/google/jax#installation)
+First, follow [these instructions](https://github.com/jax-ml/jax#installation)
 to install JAX with the relevant accelerator support.
 
 Then, install Haiku using pip:
@@ -284,7 +309,7 @@ params = forward.init(next(key), x)
 # values from the `params` that are passed as the first argument.  Note that
 # models transformed using `hk.transform(f)` must be called with an additional
 # `rng` argument: `forward.apply(params, rng, x)`. Use
-# `hk.without_apply_rng(hk.transform(f))` is this is undesirable.
+# `hk.without_apply_rng(hk.transform(f))` if this is undesirable.
 y = forward.apply(params, None, x)
 ```
 
@@ -387,7 +412,7 @@ params = loss_fn_t.init(rng, sample_image, sample_label)
 
 # Replicate params onto all devices.
 num_devices = jax.local_device_count()
-params = jax.tree_util.tree_map(lambda x: np.stack([x] * num_devices), params)
+params = jax.tree.map(lambda x: np.stack([x] * num_devices), params)
 
 def make_superbatch():
   """Constructs a superbatch, i.e. one batch of data per device."""
@@ -425,10 +450,10 @@ To cite this repository:
 
 ```
 @software{haiku2020github,
-  author = {Tom Hennigan and Trevor Cai and Tamara Norman and Igor Babuschkin},
+  author = {Tom Hennigan and Trevor Cai and Tamara Norman and Lena Martens and Igor Babuschkin},
   title = {{H}aiku: {S}onnet for {JAX}},
   url = {http://github.com/deepmind/dm-haiku},
-  version = {0.0.3},
+  version = {0.0.13},
   year = {2020},
 }
 ```
@@ -437,6 +462,9 @@ In this bibtex entry, the version number is intended to be from
 [`haiku/__init__.py`](https://github.com/deepmind/dm-haiku/blob/main/haiku/__init__.py),
 and the year corresponds to the project's open-source release.
 
-[JAX]: https://github.com/google/jax
+[JAX]: https://github.com/jax-ml/jax
 [Sonnet]: https://github.com/deepmind/sonnet
 [Tensorflow]: https://github.com/tensorflow/tensorflow
+[Flax]: https://github.com/google/flax
+[Google DeepMind]: https://blog.google/technology/ai/april-ai-update/
+[Google Brain]: https://research.google/teams/brain/

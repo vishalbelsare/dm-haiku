@@ -14,49 +14,46 @@
 # ==============================================================================
 """Base Haiku module."""
 
+from collections.abc import Callable, Mapping
 import contextlib
 import functools
 import inspect
 import re
-import sys
-from typing import (Any, Callable, ContextManager, Dict, Mapping, NamedTuple,
-                    Optional, Set, Tuple, Type, TypeVar)
+from typing import Any, ContextManager, NamedTuple, Protocol, TypeVar
 
 from haiku._src import base
+from haiku._src import config
 from haiku._src import data_structures
-from haiku._src import stateful
 from haiku._src import utils
+import jax
 import jax.numpy as jnp
 
-# pylint: disable=g-import-not-at-top
-if sys.version_info < (3, 8):
-  from typing_extensions import Protocol
-else:
-  from typing import Protocol
-# pylint: enable=g-import-not-at-top
 
-ThreadLocalStack = data_structures.ThreadLocalStack
 T = TypeVar("T")
+
+ThreadLocalStack = data_structures.ThreadLocalStack[T]
+
 _APPLY_NAME_SCOPE = "__haiku_name_scope"
 _CUSTOM_NAME = "__haiku_custom_name"
-modules_with_named_call = False
 
 
-def profiler_name_scopes(enabled=True):
-  """Enable/disable profiler name_scopes on all haiku module methods.
+class Future:
+  """Represents a value that will be produced eventually."""
 
-  Note: currently only enables for ``__call__``. See: :func:`named_call` if you
-  want to annotate other methods explicitly.
+  def __init__(self):
+    self._result_set = False
+    self._result = None
 
-  Args:
-    enabled: Whether to enable name scopes or not.
-  Returns:
-    The previous value of the name_scopes setting.
-  """
-  global modules_with_named_call
-  previously_enabled = modules_with_named_call
-  modules_with_named_call = enabled
-  return previously_enabled
+  def set_result(self, result: type["Module"]):
+    if self._result_set:
+      raise ValueError("Result already set.")
+    self._result_set = True
+    self._result = result
+
+  def result(self) -> type["Module"]:
+    if not self._result_set:
+      raise ValueError("Result not set.")
+    return self._result
 
 
 # We subclass `type(Protocol)` in order to avoid metaclass conflicts when
@@ -66,12 +63,13 @@ class ModuleMetaclass(type(Protocol)):
   """Metaclass for `Module`."""
 
   def __new__(  # pylint: disable=bad-classmethod-argument
-      mcs: Type[Type[T]],
+      mcs: type[type[T]],
       name: str,
-      bases: Tuple[Type[Any], ...],
-      clsdict: Dict[str, Any],
-  ) -> Type[T]:
+      bases: tuple[type[Any], ...],
+      clsdict: dict[str, Any],
+  ) -> type[T]:
     method_names = []
+    cls_fut = Future()
 
     for key, value in clsdict.items():
       if key == "module_name":
@@ -85,10 +83,11 @@ class ModuleMetaclass(type(Protocol)):
 
       elif isinstance(value, property):
         # TODO(tomhennigan) Preserve the type of property subclasses.
+        p = value
         clsdict[key] = property(
-            value.fget if not value.fget else wrap_method(key, value.fget),
-            value.fset if not value.fset else wrap_method(key, value.fset),
-            value.fdel if not value.fdel else wrap_method(key, value.fdel),
+            p.fget if not p.fget else wrap_method(key, p.fget, cls_fut.result),
+            p.fset if not p.fset else wrap_method(key, p.fset, cls_fut.result),
+            p.fdel if not p.fdel else wrap_method(key, p.fdel, cls_fut.result),
             doc=value.__doc__)
 
       elif inspect.isfunction(value):
@@ -106,7 +105,10 @@ class ModuleMetaclass(type(Protocol)):
         "__repr__",
         lambda module: module._auto_repr)  # pylint: disable=protected-access
 
-    cls = super(ModuleMetaclass, mcs).__new__(mcs, name, bases, clsdict)
+    cls = super().__new__(mcs, name, bases, clsdict)
+
+    # Provides access to the class object to method interceptors.
+    cls_fut.set_result(cls)
 
     for method_name in method_names:
       # Note: the code below is subtle, we need to ensure that we're wrapping
@@ -117,12 +119,12 @@ class ModuleMetaclass(type(Protocol)):
       # to decorator functions using args[0]).
       # Equivalent to: `cls.__dict__[method_name].__get__(None, cls)`
       method = getattr(cls, method_name)
-      method = wrap_method(method_name, method)
+      method = wrap_method(method_name, method, cls_fut.result)
       setattr(cls, method_name, method)
 
     return cls
 
-  def __call__(cls: Type[T], *args, **kwargs) -> T:  # pylint: disable=no-self-argument
+  def __call__(cls, *args, **kwargs) -> Any:  # pylint: disable=no-self-argument
     # Call new such that we have an un-initialized module instance that we can
     # still reference even if there is an exception during __init__. This is
     # needed such that we can make sure the name_scope constructed in __init__
@@ -132,11 +134,21 @@ class ModuleMetaclass(type(Protocol)):
     # with the new class and not the metaclass.
     module = cls.__new__(cls, *args, **kwargs)  # pytype: disable=wrong-arg-types
 
-    # Now attempt to initialize the object.
-    init = wrap_method("__init__", cls.__init__)
-    init(module, *args, **kwargs)
+    # We populate _auto_repr before `__init__` to allow `repr(self)` during the
+    # constructor of the module.
+    if (config.get_config().module_auto_repr and
+        getattr(module, "AUTO_REPR", True)):
+      module_repr = utils.auto_repr(cls, *args, **kwargs)  # pylint: disable=protected-access
+    else:
+      module_repr = object.__repr__(module)
 
-    module._auto_repr = utils.auto_repr(cls, *args, **kwargs)  # pylint: disable=protected-access
+    # Avoid triggering user defined __setattr__ overrides since we have not yet
+    # run their constructor.
+    object.__setattr__(module, "_auto_repr", module_repr)
+
+    # Now attempt to initialize the object.
+    init = wrap_method("__init__", cls.__init__, lambda: cls)
+    init(module, *args, **kwargs)
 
     ran_super_ctor = hasattr(module, "module_name")
     if not ran_super_ctor:
@@ -146,6 +158,12 @@ class ModuleMetaclass(type(Protocol)):
           "__init__ method:\n\nsuper(%s, self).__init__()" % cls.__name__)
 
     return module
+
+  @property
+  def __signature__(cls):  # pylint: disable=no-self-argument
+    signature = inspect.signature(cls.__init__)
+    params = tuple(signature.parameters.values())
+    return signature.replace(parameters=params[1:])
 
 
 class MethodContext(NamedTuple):
@@ -206,15 +224,18 @@ class MethodContext(NamedTuple):
       short circuit all the other interceptors, in general you should prefer to
       call the ``next_fun`` passed to your interceptor which will run
       ``orig_method`` after running all other interceptors.
+    orig_class: The class which defined `orig_method`. Note that when
+      using inheritance this is not necessarily the same as `type(module)`.
   """
 
   module: "Module"
   method_name: str
   orig_method: Callable[..., Any]
+  orig_class: type["Module"]
 
 
-Args = Tuple[Any]
-Kwargs = Dict[str, Any]
+Args = tuple[Any]
+Kwargs = dict[str, Any]
 NextGetter = Callable[..., Any]
 MethodGetter = Callable[[NextGetter, Args, Kwargs, MethodContext], Any]
 interceptor_stack: ThreadLocalStack[MethodGetter] = ThreadLocalStack()
@@ -238,11 +259,11 @@ def intercept_methods(interceptor: MethodGetter):
   ...     return next_f(*args, **kwargs)
   ...
   ...   def cast_if_array(x):
-  ...     if isinstance(x, jnp.ndarray):
+  ...     if isinstance(x, jax.Array):
   ...       x = x.astype(jnp.float32)
   ...     return x
   ...
-  ...   args, kwargs = jax.tree_map(cast_if_array, (args, kwargs))
+  ...   args, kwargs = jax.tree.map(cast_if_array, (args, kwargs))
   ...   out = next_f(*args, **kwargs)
   ...   return out
 
@@ -267,10 +288,15 @@ def intercept_methods(interceptor: MethodGetter):
   return interceptor_stack(interceptor)
 
 
+def intercept_methods_global(interceptor: MethodGetter):
+  interceptor_stack.pushleft(interceptor)
+
+
 def run_interceptors(  # pylint: disable=invalid-name
     bound_method: Callable[..., Any],
     method_name: str,
     self: "Module",
+    orig_class: type["Module"],
     *args: Args,
     **kwargs: Kwargs,
 ) -> Any:
@@ -280,7 +306,8 @@ def run_interceptors(  # pylint: disable=invalid-name
 
   ctx = MethodContext(module=self,
                       method_name=method_name,
-                      orig_method=bound_method)
+                      orig_method=bound_method,
+                      orig_class=orig_class)
   interceptor_stack_copy = interceptor_stack.clone()
 
   def next_fun(*args, **kwargs):
@@ -295,27 +322,29 @@ def run_interceptors(  # pylint: disable=invalid-name
   return next_fun(*args, **kwargs)
 
 
-def simulate_module_call(module):
+def simulate_module_method(module, method_name):
   frame = base.current_frame()
-  state = base.ModuleState(module=module, method_name="__call__")
+  state = base.ModuleState(module=module, method_name=method_name)
   return frame.module(state)
 
 
 class NameScope:
   """Context manager that when active adds a new name in the hierarcy."""
 
-  def __init__(self, name: str):
+  def __init__(self, name: str, method_name: str):
     if not name or name[0] == "/":
       raise ValueError("Name scopes must not start with /")
 
+    parts = [name] if name.startswith(OVERRIDE_PREFIX) else name.split("/")
     module = None
     with contextlib.ExitStack() as stack:
-      for subname in name.split("/"):
-        module = Module(name=subname)
-        stack.enter_context(simulate_module_call(module))
+      for subname in parts:
+        module = NameScopeModule(name=subname)
+        stack.enter_context(simulate_module_method(module, method_name))
 
     self.__entered = False
     self.__module = module
+    self.__method = method_name
     self.__stack = contextlib.ExitStack()
 
   def __enter__(self):
@@ -324,7 +353,8 @@ class NameScope:
     if self.__entered:
       raise ValueError("name_scope is not reentrant")
     self.__entered = True
-    self.__stack.enter_context(simulate_module_call(self.__module))
+    self.__stack.enter_context(simulate_module_method(self.__module,
+                                                      self.__method))
 
   def __exit__(self, exc_type, exc_value, traceback):
     try:
@@ -334,10 +364,14 @@ class NameScope:
       self.__stack = None
 
 
-def name_scope(name: str) -> ContextManager[None]:
+def name_scope(
+    name: str,
+    *,
+    method_name: str = "__call__",
+) -> ContextManager[None]:
   """Context manager which adds a prefix to all new modules, params or state.
 
-  >>> with hk.experimental.name_scope("my_name_scope"):
+  >>> with hk.name_scope("my_name_scope"):
   ...   net = hk.Linear(1, name="my_linear")
   >>> net.module_name
   'my_name_scope/my_linear'
@@ -347,14 +381,14 @@ def name_scope(name: str) -> ContextManager[None]:
 
   >>> class MyModule(hk.Module):
   ...   def __call__(self, x):
-  ...     with hk.experimental.name_scope("my_name_scope"):
+  ...     with hk.name_scope("my_name_scope"):
   ...       submodule = hk.Linear(1, name="submodule")
   ...       w = hk.get_parameter("w", [], init=jnp.ones)
   ...     return submodule(x) + w
 
   >>> f = hk.transform(lambda x: MyModule()(x))
   >>> params = f.init(jax.random.PRNGKey(42), jnp.ones([1, 1]))
-  >>> jax.tree_map(jnp.shape, params)
+  >>> jax.tree.map(jnp.shape, params)
   {'my_module/my_name_scope': {'w': ()},
    'my_module/my_name_scope/submodule': {'b': (1,), 'w': (1, 1)}}
 
@@ -369,21 +403,27 @@ def name_scope(name: str) -> ContextManager[None]:
 
   Args:
     name: The name scope to use (e.g. ``"foo"`` or ``"foo/bar"``).
+    method_name: (Advanced uses only). Since name scopes are equivalent to
+      calling methods on modules the method name attribute allows you to specify
+      which method name you want to simulate. Most users should leave this as
+      the default value (`"__call__"`).
 
   Returns:
     A single use context manager that when active prefixes new modules,
     parameters or state with the given name.
   """
-  base.assert_context("experimental.name_scope")
-  return NameScope(name)
+  base.assert_context("name_scope")
+  return NameScope(name, method_name)
 
 
-def wrap_method(method_name, unbound_method):
+def wrap_method(method_name, unbound_method, cls_resolver):
   """Wraps `method` such that it enters name stack and runs method interceptors.
 
   Args:
     method_name: The name of the method (e.g. "__call__").
     unbound_method: An unbound method to wrap.
+    cls_resolver: A callable the returns the Module subclass which defined this
+      method.
 
   Returns:
     A function that runs the original method but in a context where parameters
@@ -411,19 +451,15 @@ def wrap_method(method_name, unbound_method):
     with frame.module(state), _module_method_call(self, method_name):
       # hk.Module enters the module name scope for all methods.
       module_name = getattr(self, "module_name", None)
+      orig_class = cls_resolver()
       f = functools.partial(unbound_method, self)
-      f = functools.partial(run_interceptors, f, method_name, self)
-      # TODO(tomhennigan): With omnistaging primitives (like named call) will
-      # stage out return values eagerly. For functions that produce non-Array
-      # values (e.g. `def is_batched(self, x) -> bool`) a tracer will be
-      # returned that might result in a concretization error. For now we only
-      # enable named call on __call__ (covering 99% of the interesting usages)
-      # with an assumption that __call__ is `f(*) -> Tree[Array]`. Longer term
-      # we may want to split static and dynamic results in named call to support
-      # other methods.
-      if modules_with_named_call and module_name and method_name == "__call__":
-        local_name = module_name.split("/")[-1]
-        f = stateful.named_call(f, name=local_name)
+      f = functools.partial(run_interceptors, f, method_name, self,
+                            orig_class)
+      if module_name:
+        local_module_name = module_name.split("/")[-1]
+        f = jax.named_call(f, name=local_module_name)
+        if method_name != "__call__":
+          f = jax.named_call(f, name=method_name)
 
       out = f(*args, **kwargs)
 
@@ -448,7 +484,130 @@ _VALID_IDENTIFIER_R = re.compile(r"^[a-zA-Z_]([a-zA-Z0-9_])*$")
 valid_identifier = lambda name: bool(_VALID_IDENTIFIER_R.match(name))
 
 
-class Module(object, metaclass=ModuleMetaclass):
+def name_and_number(name: str) -> tuple[str, int | None]:
+  splits = re.split(r"_(0|[1-9]\d*)$", name, 3)
+  if len(splits) > 1:
+    return splits[0], int(splits[1])
+  else:
+    return name, None
+
+
+def unique_and_canonical_name(name: str) -> str:
+  """Returns a canonical name for the given name."""
+  frame = base.current_frame()
+
+  # If we are outside init/call then prefix the name with the method name.
+  if len(frame.module_stack) > 1:
+    # -2 since we are inside the ctor and want to look at the caller state.
+    module_state = frame.module_stack.peek(-2)
+
+    # Make sure to include the method name if appropriate.
+    method_name = module_state.method_name
+    if method_name == "__init__":
+      name = "~/" + name
+    elif method_name != "__call__":
+      name = "~" + method_name + "/" + name
+
+    # Include the parent name.
+    parent_module = module_state.module
+    parent_name = base.safe_get_module_name(parent_module)
+    name = parent_name + "/" + name
+
+  # Test if the user has explicitly numbered this module.
+  name, n = name_and_number(name)
+  explicit_n = n is not None
+
+  # Determine a unique name for this module within the current context.
+  if n is None:
+    n = next_module_number(name)
+  name = f"{name}_{n}" if explicit_n or n else name
+
+  # Final sanity check that this name has not been used before.
+  reserve_module_name(name, check_unique=True)
+
+  return name
+
+
+def reserve_module_name(name: str, *, check_unique: bool):
+  """Reserves the given module name."""
+  frame = base.current_frame()
+  used_names = frame.used_names_stack.peek(-2)
+  if check_unique and name in used_names:
+    raise ValueError(f"Module name '{name}' is not unique.")
+  used_names.add(name)
+
+  name, number = name_and_number(name)
+  if number is None:
+    number = 0
+  counters = frame.counter_stack.peek(-2)
+  counters[name] = max(counters[name], number + 1)
+
+
+def next_module_number(name: str) -> int:
+  frame = base.current_frame()
+  counters = frame.counter_stack.peek(-2)
+  return counters[name]
+
+
+# NOTE: Since `:` is not a valid symbol in a module name (it has been rejected
+# by check_name since the first version of Haiku) we know that no existing users
+# have this name so it is a safe token.
+OVERRIDE_PREFIX = "FORCE:"
+
+
+def force_name(name: str) -> str:
+  """Forces Haiku to use this name, ignoring all context information.
+
+  NOTE: This method is intended for advanced use cases only and should be
+  avoided whenever possible as it effectively enforces a singleton pattern when
+  setting absolute names.
+
+  Haiku names modules according to where they are created (e.g. the stack of
+  modules that created them, or the current :func:`~haiku.name_scope`). This
+  function allows you to create modules that ignore all of this and have
+  precisely the name you provide.
+
+  This might be useful in the case that you have two modules and you want to
+  force them to share parameters:
+
+  >>> mod0 = hk.Linear(1)
+  >>> some_hyperparameter = True
+  >>> if some_hyperparameter:
+  ...   # Force mod1 and mod0 to have shared weights.
+  ...   mod1 = hk.Linear(1, name=hk.force_name(mod0.module_name))
+  ... else:
+  ...   # mod0 and mod1 are independent.
+  ...   mod1 = hk.Linear(1)
+
+  (A simpler version of this snippet would do `mod1 = mod0` instead of using
+  force_name, however in real examples it can be simpler to use force_name,
+  especially in cases where you may not have access to the module instance
+  without lots of plumbing, but getting the module name is easy [e.g. it is a
+  hyperparameter]).
+
+  Args:
+    name: String name for the module. For example ``"foo"`` or ``"foo/bar"``.
+
+  Returns:
+    A value suitable to pass into the ``name`` argument of any Haiku module
+    constructor.
+  """
+  return f"{OVERRIDE_PREFIX}{name}"
+
+
+def check_name(component: str, name: str, allow_leading_tilde: bool = False):
+  if allow_leading_tilde and component.startswith("~"):
+    component = component[1:]
+    if not component:
+      # "~" is a valid component name (e.g. "foo/~/bar" is a valid name).
+      return
+
+  if not valid_identifier(component):
+    raise ValueError(f"'{name}' is not a valid module name (must be a "
+                     "valid Python identifier)")
+
+
+class Module(metaclass=ModuleMetaclass):
   """Base class for Haiku modules.
 
   A Haiku module is a lightweight container for variables and other modules.
@@ -472,11 +631,11 @@ class Module(object, metaclass=ModuleMetaclass):
   >>> x = 1.
   >>> rng = None
   >>> params = forward.init(rng, x)
-  >>> forward.apply(params, None, x)
-  DeviceArray(2., dtype=float32)
+  >>> print(forward.apply(params, None, x))
+  2.0
   """
 
-  def __init__(self, name: Optional[str] = None):
+  def __init__(self, name: str | None = None):
     """Initializes the current module with the given name.
 
     Subclasses should call this constructor before creating other modules or
@@ -493,18 +652,25 @@ class Module(object, metaclass=ModuleMetaclass):
         name = self.name
       else:
         name = utils.camel_to_snake(type(self).__name__)
-    if not valid_identifier(name):
-      raise ValueError(
-          "'{}' is not a valid module name (must be a valid Python identifier)"
-          .format(name))
-    self._submodules = set()  # type: Set[str]
-    self.module_name = unique_and_canonical_name(name)
+
+    if name.startswith(OVERRIDE_PREFIX):
+      name = name[len(OVERRIDE_PREFIX):]
+      for component in name.split("/"):
+        check_name(component, name, allow_leading_tilde=True)
+      reserve_module_name(name, check_unique=False)
+    else:
+      check_name(name, name)
+      name = unique_and_canonical_name(name)
+
+    self._submodules: set[str] = set()
+    self.module_name = name
     self.name = self.module_name.split("/")[-1]
+    self._creation_frame_id = base.current_frame().frame_id
 
   # Support @dataclass annotated modules.
   __post_init__ = __init__
 
-  def params_dict(self) -> Mapping[str, jnp.array]:
+  def params_dict(self) -> Mapping[str, jnp.ndarray]:
     """Returns parameters keyed by name for this module and submodules."""
     if not base.frame_stack:
       raise ValueError(
@@ -512,7 +678,7 @@ class Module(object, metaclass=ModuleMetaclass):
 
     return params_or_state_dict(self.module_name, self._submodules, "params")
 
-  def state_dict(self) -> Mapping[str, jnp.array]:
+  def state_dict(self) -> Mapping[str, jnp.ndarray]:
     """Returns state keyed by name for this module and submodules."""
     if not base.frame_stack:
       raise ValueError(
@@ -523,9 +689,9 @@ class Module(object, metaclass=ModuleMetaclass):
 
 def params_or_state_dict(
     module_name: str,
-    submodules: Set[str],
+    submodules: set[str],
     which: str,
-) -> Mapping[str, jnp.array]:
+) -> Mapping[str, jnp.ndarray]:
   """Returns module parameters or state for the given module or submodules."""
   assert which in ("params", "state")
   out = {}
@@ -581,11 +747,11 @@ def name_like(method_name: str) -> Callable[[T], T]:
   ``__call__``:
 
   >>> class Autoencoder(hk.Module):
-  ...   @hk.experimental.name_like("__call__")
+  ...   @hk.name_like("__call__")
   ...   def encode(self, x):
   ...     return hk.Linear(10, name="enc")(x)  # name: autoencoder/enc
   ...
-  ...   @hk.experimental.name_like("__call__")
+  ...   @hk.name_like("__call__")
   ...   def decode(self, z):
   ...     return hk.Linear(10, name="dec")(z)  # name: autoencoder/dec
   ...
@@ -607,11 +773,11 @@ def name_like(method_name: str) -> Callable[[T], T]:
   is only applied within a method:
 
   >>> class Autoencoder(hk.Module):
-  ...   @hk.experimental.name_like("__call__")
+  ...   @hk.name_like("__call__")
   ...   def encode(self, x):
   ...     return hk.Linear(10)(x)  # name: autoencoder/linear
   ...
-  ...   @hk.experimental.name_like("__call__")
+  ...   @hk.name_like("__call__")
   ...   def decode(self, z):
   ...     return hk.Linear(10)(z)  # name: autoencoder/linear  <-- NOT INTENDED
 
@@ -619,11 +785,11 @@ def name_like(method_name: str) -> Callable[[T], T]:
   with their former name:
 
   >>> class Autoencoder(hk.Module):
-  ...   @hk.experimental.name_like("__call__")
+  ...   @hk.name_like("__call__")
   ...   def encode(self, x):
   ...     return hk.Linear(10, name="linear")(x)    # name: autoencoder/linear
   ...
-  ...   @hk.experimental.name_like("__call__")
+  ...   @hk.name_like("__call__")
   ...   def decode(self, z):
   ...     return hk.Linear(10, name="linear_1")(z)  # name: autoencoder/linear_1
 
@@ -639,54 +805,6 @@ def name_like(method_name: str) -> Callable[[T], T]:
     setattr(method, _CUSTOM_NAME, method_name)
     return method
   return decorator
-
-
-def unique_and_canonical_name(name: str) -> str:
-  """Returns a canonical name for the given name."""
-  frame = base.current_frame()
-
-  # If we are outside init/call then prefix the name with the method name.
-  if len(frame.module_stack) > 1:
-    # -2 since we are inside the ctor and want to look at the caller state.
-    module_state = frame.module_stack.peek(-2)
-
-    # Make sure to include the method name if appropriate.
-    method_name = module_state.method_name
-    if method_name == "__init__":
-      name = "~/" + name
-    elif method_name != "__call__":
-      name = "~" + method_name + "/" + name
-
-    # Include the parent name.
-    parent_module = module_state.module
-    parent_name = base.safe_get_module_name(parent_module)
-    name = parent_name + "/" + name
-
-  # Test if the user has explicitly numbered this module.
-  splits = re.split(r"_(\d+)$", name, 3)
-  if len(splits) > 1:
-    name, n = splits[0], int(splits[1])
-    explicit_n = True
-  else:
-    n = None
-    explicit_n = False
-
-  # Determine a unique name for this module within the current context.
-  counters = frame.counter_stack.peek(-2)
-  if n is not None:
-    counters[name] = max(counters[name], n + 1)
-  else:
-    n = counters[name]
-    counters[name] += 1
-  qualified_name = f"{name}_{n}" if explicit_n or n else name
-
-  # Final sanity check that this name has not been used before.
-  used_names = frame.used_names_stack.peek(-2)
-  if qualified_name in used_names:
-    raise ValueError(f"Module name '{qualified_name}' is not unique.")
-  used_names.add(qualified_name)
-
-  return qualified_name
 
 MethodHook = Callable[[Module, str], ContextManager[None]]
 method_hook_stack: ThreadLocalStack[MethodHook] = ThreadLocalStack()
@@ -704,3 +822,7 @@ def _module_method_call(module: Module, method_name: str):
     for method_hook in method_hook_stack:
       stack.enter_context(method_hook(module, method_name))
     yield
+
+
+class NameScopeModule(Module):
+  pass

@@ -24,8 +24,7 @@ The average pooling is currently done via a mean, and returns (N, 1, 1, 1024).
 If something different is desired, replace with AvgPool.
 """
 
-import types
-from typing import Optional, Sequence
+from collections.abc import Sequence
 
 from haiku._src import basic
 from haiku._src import batch_norm
@@ -33,18 +32,20 @@ from haiku._src import conv
 from haiku._src import depthwise_conv
 from haiku._src import module
 from haiku._src import reshape
-
 import jax
 import jax.numpy as jnp
 
-# If forking replace this block with `import haiku as hk`.
-hk = types.ModuleType("haiku")
-hk.Module = module.Module
-hk.BatchNorm = batch_norm.BatchNorm
-hk.Conv2D = conv.Conv2D
-hk.DepthwiseConv2D = depthwise_conv.DepthwiseConv2D
-hk.Flatten = reshape.Flatten
-hk.Linear = basic.Linear
+
+# If you are forking replace this with `import haiku as hk`.
+# pylint: disable=invalid-name
+class hk:
+  Module = module.Module
+  BatchNorm = batch_norm.BatchNorm
+  Conv2D = conv.Conv2D
+  DepthwiseConv2D = depthwise_conv.DepthwiseConv2D
+  Flatten = reshape.Flatten
+  Linear = basic.Linear
+# pylint: enable=invalid-name
 del basic, batch_norm, conv, depthwise_conv, module, reshape
 
 
@@ -56,7 +57,7 @@ class MobileNetV1Block(hk.Module):
       channels: int,
       stride: int,
       use_bn: bool = True,
-      name: Optional[str] = None,
+      name: str | None = None,
   ):
     super().__init__(name=name)
     self.channels = channels
@@ -64,7 +65,7 @@ class MobileNetV1Block(hk.Module):
     self.use_bn = use_bn
     self.with_bias = not use_bn
 
-  def __call__(self, inputs: jnp.ndarray, is_training: bool) -> jnp.ndarray:
+  def __call__(self, inputs: jax.Array, is_training: bool) -> jax.Array:
     depthwise = hk.DepthwiseConv2D(
         channel_multiplier=1,
         kernel_shape=3,
@@ -107,7 +108,7 @@ class MobileNetV1(hk.Module):
                                  512, 512, 512, 512, 1024, 1024),
       num_classes: int = 1000,
       use_bn: bool = True,
-      name: Optional[str] = None,
+      name: str | None = None,
   ):
     """Constructs a MobileNetV1 model.
 
@@ -131,7 +132,7 @@ class MobileNetV1(hk.Module):
     self.with_bias = not use_bn
     self.num_classes = num_classes
 
-  def __call__(self, inputs: jnp.ndarray, is_training: bool) -> jnp.ndarray:
+  def __call__(self, inputs: jax.Array, is_training: bool) -> jax.Array:
     initial_conv = hk.Conv2D(
         output_channels=32,
         kernel_shape=(3, 3),

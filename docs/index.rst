@@ -18,15 +18,15 @@ abstractions for machine learning research.
 
     forward = hk.transform(forward)
 
-    rng = jax.random.PRNGKey(42)
+    rng = hk.PRNGSequence(jax.random.PRNGKey(42))
     x = jnp.ones([8, 28 * 28])
-    params = forward.init(rng, x)
-    logits = forward.apply(params, rng, x)
+    params = forward.init(next(rng), x)
+    logits = forward.apply(params, next(rng), x)
 
 Installation
 ------------
 
-See https://github.com/google/jax#pip-installation for instructions on
+See https://github.com/jax-ml/jax#pip-installation for instructions on
 installing JAX.
 
 We suggest installing the latest version of Haiku by running::
@@ -38,15 +38,15 @@ Alternatively, you can install via PyPI::
     $ pip install -U dm-haiku
 
 .. toctree::
-   :caption: Guides
+   :caption: Basics
    :maxdepth: 1
 
    notebooks/basics
    notebooks/transforms
 
 .. toctree::
-   :caption: API Documentation
-   :maxdepth: 1
+   :caption: API reference
+   :maxdepth: 2
 
    api
 
@@ -54,10 +54,12 @@ Alternatively, you can install via PyPI::
    :caption: Advanced
    :maxdepth: 1
 
+   notebooks/flax
    notebooks/jax2tf
    notebooks/build_your_own_haiku
    notebooks/visualization
    notebooks/non_trainable
+   notebooks/parameter_sharing
 
 Known issues
 ------------

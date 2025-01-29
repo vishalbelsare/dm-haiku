@@ -14,10 +14,10 @@
 # ==============================================================================
 """ImageNet dataset with typical pre-processing."""
 
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 import enum
 import itertools as it
 import types
-from typing import Generator, Iterable, Mapping, Optional, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -70,7 +70,7 @@ def load(
     dtype: jnp.dtype = jnp.float32,
     transpose: bool = False,
     zeros: bool = False,
-) -> Generator[Batch, None, None]:
+) -> Iterator[Batch]:
   """Loads the given split of the dataset."""
   if zeros:
     h, w, c = 224, 224, 3
@@ -87,7 +87,7 @@ def load(
       yield from it.repeat(batch, num_batches)
 
   if is_training:
-    start, end = _shard(split, jax.host_id(), jax.host_count())
+    start, end = _shard(split, jax.process_index(), jax.process_count())
   else:
     start, end = _shard(split, 0, 1)
   tfds_split = tfds.core.ReadInstruction(_to_tfds_split(split),
@@ -106,7 +106,7 @@ def load(
   ds = ds.with_options(options)
 
   if is_training:
-    if jax.host_count() > 1:
+    if jax.process_count() > 1:
       # Only cache if we are reading a subset of the dataset.
       ds = ds.cache()
     ds = ds.repeat()
@@ -153,14 +153,15 @@ def load(
 
 
 def _device_put_sharded(sharded_tree, devices):
-  leaves, treedef = jax.tree_flatten(sharded_tree)
+  leaves, treedef = jax.tree.flatten(sharded_tree)
   n = leaves[0].shape[0]
   return jax.device_put_sharded(
-      [jax.tree_unflatten(treedef, [l[i] for l in leaves]) for i in range(n)],
-      devices)
+      [jax.tree.unflatten(treedef, [l[i] for l in leaves]) for i in range(n)],
+      devices,
+  )
 
 
-def double_buffer(ds: Iterable[Batch]) -> Generator[Batch, None, None]:
+def double_buffer(ds: Iterable[Batch]) -> Iterator[Batch]:
   """Keeps at least two batches on the accelerator.
 
   The current GPU allocator design reuses previous allocations. For a training
@@ -204,7 +205,7 @@ def _to_tfds_split(split: Split) -> tfds.Split:
     return tfds.Split.VALIDATION
 
 
-def _shard(split: Split, shard_index: int, num_shards: int) -> Tuple[int, int]:
+def _shard(split: Split, shard_index: int, num_shards: int) -> tuple[int, int]:
   """Returns [start, end) for the given shard index."""
   assert shard_index < num_shards
   arange = np.arange(split.num_examples)
@@ -250,8 +251,8 @@ def _distorted_bounding_box_crop(
     jpeg_shape: tf.Tensor,
     bbox: tf.Tensor,
     min_object_covered: float,
-    aspect_ratio_range: Tuple[float, float],
-    area_range: Tuple[float, float],
+    aspect_ratio_range: tuple[float, float],
+    area_range: tuple[float, float],
     max_attempts: int,
 ) -> tf.Tensor:
   """Generates cropped_image using one of the bboxes randomly distorted."""
@@ -292,7 +293,7 @@ def _decode_and_random_crop(image_bytes: tf.Tensor) -> tf.Tensor:
 
 def _decode_and_center_crop(
     image_bytes: tf.Tensor,
-    jpeg_shape: Optional[tf.Tensor] = None,
+    jpeg_shape: tf.Tensor | None = None,
 ) -> tf.Tensor:
   """Crops to center of image with padding then scales."""
   if jpeg_shape is None:

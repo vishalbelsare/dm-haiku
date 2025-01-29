@@ -21,7 +21,7 @@ from absl.testing import parameterized
 from haiku._src import initializers
 from haiku._src import test_utils
 import jax
-from jax.config import config
+from jax import config
 import jax.numpy as jnp
 import numpy as np
 
@@ -46,6 +46,9 @@ class InitializersTest(parameterized.TestCase):
         initializers.VarianceScaling(2.0),
         initializers.VarianceScaling(as_np_f64(2.0)),
         initializers.VarianceScaling(2.0, mode="fan_in"),
+        initializers.VarianceScaling(as_np_f64(2.0), mode="fan_in",
+                                     fan_in_axes=[0]),
+        initializers.VarianceScaling(2.0, mode="fan_in", fan_in_axes=[0]),
         initializers.VarianceScaling(as_np_f64(2.0), mode="fan_in"),
         initializers.VarianceScaling(2.0, mode="fan_out"),
         initializers.VarianceScaling(as_np_f64(2.0), mode="fan_out"),
@@ -102,6 +105,10 @@ class InitializersTest(parameterized.TestCase):
     self.assertEqual(fan_in_out3, (3, 4))
     fan_in_out4 = initializers._compute_fans([1, 2, 3, 4])
     self.assertEqual(fan_in_out4, (6, 8))
+    fan_in_out5 = initializers._compute_fans([3, 5, 9], fan_in_axes=[0])
+    self.assertEqual(fan_in_out5, (3, 45))
+    fan_in_out6 = initializers._compute_fans([3, 5, 7, 4], fan_in_axes=[0, 1])
+    self.assertEqual(fan_in_out6, (15, 28))
 
   @test_utils.transform_and_run
   def test_orthogonal_invalid_shape(self):
@@ -178,6 +185,18 @@ class InitializersTest(parameterized.TestCase):
       self.assertEqual(generated.shape, shape)
       self.assertEqual(generated.dtype, dtype)
 
+  @parameterized.parameters(
+      *it.product([[1], [1, 2, 3], [1, 2, 3, 4]],
+                  [jnp.int32, jnp.float32],
+                  [True, False]))
+  def test_constant_with_list(self, k, dtype, broadcast):
+    init = initializers.Constant(k)
+    shape = (1, 1, len(k)) if broadcast else (len(k),)
+    actual = init(shape, dtype)
+    expected = jnp.broadcast_to(jnp.asarray(k).astype(dtype), shape)
+    np.testing.assert_array_equal(actual, expected)
+    self.assertEqual(actual.shape, shape)
+    self.assertEqual(actual.dtype, dtype)
 
 if __name__ == "__main__":
   config.update("jax_enable_x64", True)

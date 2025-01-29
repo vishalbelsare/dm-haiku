@@ -15,8 +15,6 @@
 """Moving averages."""
 
 import re
-import types
-from typing import Optional
 import warnings
 
 from haiku._src import base
@@ -26,13 +24,16 @@ from haiku._src import module
 import jax
 import jax.numpy as jnp
 
-# If you are forking replace this with `import haiku as hk`.
-hk = types.ModuleType("haiku")
-hk.get_state = base.get_state
-hk.set_state = base.set_state
-hk.Module = module.Module
-hk.data_structures = data_structures
-hk.initializers = initializers
+
+# If you are forking replace this block with `import haiku as hk`.
+# pylint: disable=invalid-name
+class hk:
+  get_state = base.get_state
+  set_state = base.set_state
+  Module = module.Module
+  data_structures = data_structures
+  initializers = initializers
+# pylint: enable=invalid-name
 del base, data_structures, module, initializers
 
 
@@ -48,7 +49,7 @@ class ExponentialMovingAverage(hk.Module):
       decay,
       zero_debias: bool = True,
       warmup_length: int = 0,
-      name: Optional[str] = None,
+      name: str | None = None,
   ):
     """Initializes an ExponentialMovingAverage module.
 
@@ -91,9 +92,9 @@ class ExponentialMovingAverage(hk.Module):
 
   def __call__(
       self,
-      value: jnp.ndarray,
+      value: float | jax.Array,
       update_stats: bool = True,
-  ) -> jnp.ndarray:
+  ) -> jax.Array:
     """Updates the EMA and returns the new value.
 
     Args:
@@ -106,7 +107,7 @@ class ExponentialMovingAverage(hk.Module):
     Returns:
       The exponentially weighted average of the input value.
     """
-    if not isinstance(value, jnp.ndarray):
+    if not isinstance(value, jax.Array):
       value = jnp.asarray(value)
 
     counter = hk.get_state("counter", (), jnp.int32,
@@ -171,7 +172,7 @@ class EMAParamsTree(hk.Module):
       zero_debias: bool = True,
       warmup_length: int = 0,
       ignore_regex: str = "",
-      name: Optional[str] = None,
+      name: str | None = None,
   ):
     """Initializes an EMAParamsTree module.
 

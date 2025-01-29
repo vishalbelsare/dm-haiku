@@ -1,3 +1,7 @@
+###################
+Haiku API reference
+###################
+
 Haiku Fundamentals
 ==================
 
@@ -60,8 +64,6 @@ Modules, Parameters and State
     get_parameter
     get_state
     set_state
-    transparent
-    lift
 
 Module
 ~~~~~~
@@ -89,16 +91,6 @@ set_state
 
 .. autofunction:: set_state
 
-transparent
-~~~~~~~~~~~~
-
-.. autofunction:: transparent
-
-lift
-~~~~
-
-.. autofunction:: lift
-
 Getters and Interceptors
 ------------------------
 
@@ -106,7 +98,9 @@ Getters and Interceptors
 
     custom_creator
     custom_getter
+    custom_setter
     GetterContext
+    SetterContext
     intercept_methods
     MethodContext
 
@@ -120,10 +114,20 @@ custom_getter
 
 .. autofunction:: custom_getter
 
+custom_setter
+~~~~~~~~~~~~~
+
+.. autofunction:: custom_setter
+
 GetterContext
 ~~~~~~~~~~~~~
 
 .. autoclass:: GetterContext
+
+SetterContext
+~~~~~~~~~~~~~
+
+.. autoclass:: SetterContext
 
 intercept_methods
 ~~~~~~~~~~~~~~~~~
@@ -134,7 +138,6 @@ MethodContext
 ~~~~~~~~~~~~~
 
 .. autoclass:: MethodContext
-
 
 Random Numbers
 --------------
@@ -147,6 +150,8 @@ Random Numbers
     maybe_next_rng_key
     reserve_rng_keys
     with_rng
+    maybe_get_rng_sequence_state
+    replace_rng_sequence_state
 
 PRNGSequence
 ~~~~~~~~~~~~
@@ -179,6 +184,16 @@ with_rng
 
 .. autofunction:: with_rng
 
+maybe_get_rng_sequence_state
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autofunction:: maybe_get_rng_sequence_state
+
+replace_rng_sequence_state
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autofunction:: replace_rng_sequence_state
+
 Type Hints
 ----------
 
@@ -186,11 +201,15 @@ Type Hints
 
     LSTMState
     Params
+    MutableParams
     State
+    MutableState
     Transformed
     TransformedWithState
     MultiTransformed
     MultiTransformedWithState
+    ModuleProtocol
+    SupportsCall
 
 LSTMState
 ~~~~~~~~~
@@ -202,10 +221,21 @@ Params
 
 .. autoclass:: Params
 
+MutableParams
+~~~~~~~~~~~~~
+
+.. autoclass:: MutableParams
+
 State
 ~~~~~
 
 .. autoclass:: State
+
+MutableState
+~~~~~~~~~~~~
+
+.. autoclass:: MutableState
+
 
 Transformed
 ~~~~~~~~~~~
@@ -226,6 +256,173 @@ MultiTransformedWithState
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. autoclass:: MultiTransformedWithState
+
+ModuleProtocol
+~~~~~~~~~~~~~~
+
+.. autoclass:: ModuleProtocol
+
+SupportsCall
+~~~~~~~~~~~~
+
+.. autoclass:: SupportsCall
+
+Flax Interop
+============
+
+.. automodule:: haiku.experimental.flax
+
+Haiku inside Flax
+-----------------
+
+Module
+~~~~~~
+
+.. autoclass:: Module
+
+flatten_flax_to_haiku
+~~~~~~~~~~~~~~~~~~~~~
+
+.. autofunction:: flatten_flax_to_haiku
+
+Flax inside Haiku
+-----------------
+
+lift
+~~~~
+
+.. autofunction:: lift
+
+Advanced State Management
+=========================
+
+.. automodule:: haiku
+
+Lifting
+-------
+
+.. autosummary::
+
+    lift
+    lift_with_state
+    transparent_lift
+    transparent_lift_with_state
+    LiftWithStateUpdater
+
+lift
+~~~~
+
+.. autofunction:: lift
+
+lift_with_state
+~~~~~~~~~~~~~~~
+
+.. autofunction:: lift_with_state
+
+transparent_lift
+~~~~~~~~~~~~~~~~
+
+.. autofunction:: transparent_lift
+
+transparent_lift_with_state
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autofunction:: transparent_lift_with_state
+
+LiftWithStateUpdater
+~~~~~~~~~~~~~~~~~~~~
+
+.. autoclass:: LiftWithStateUpdater
+
+Layer Stack
+-----------
+
+.. autosummary::
+
+    layer_stack
+    LayerStackTransparencyMapping
+
+layer_stack
+~~~~~~~~~~~
+
+.. autoclass:: layer_stack
+
+LayerStackTransparencyMapping
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autoclass:: LayerStackTransparencyMapping
+
+Naming
+------
+
+.. autosummary::
+
+    name_scope
+    current_name
+    DO_NOT_STORE
+    get_params
+    get_current_state
+    get_initial_state
+    force_name
+    name_like
+    transparent
+
+name_scope
+~~~~~~~~~~
+
+.. autofunction:: name_scope
+
+current_name
+~~~~~~~~~~~~
+
+.. autofunction:: current_name
+
+DO_NOT_STORE
+~~~~~~~~~~~~
+
+.. autodata:: DO_NOT_STORE
+
+get_params
+~~~~~~~~~~
+
+.. autofunction:: get_params
+
+get_current_state
+~~~~~~~~~~~~~~~~~
+
+.. autofunction:: get_current_state
+
+get_initial_state
+~~~~~~~~~~~~~~~~~
+
+.. autofunction:: get_initial_state
+
+force_name
+~~~~~~~~~~
+
+.. autofunction:: force_name
+
+name_like
+~~~~~~~~~
+
+.. autofunction:: name_like
+
+transparent
+~~~~~~~~~~~~
+
+.. autofunction:: transparent
+
+Visualisation
+-------------
+
+.. autosummary::
+
+    to_dot
+
+to_dot
+~~~~~~~~~~~~~~~
+
+.. autofunction:: to_dot
 
 Common Modules
 ==============
@@ -318,8 +515,9 @@ Convolutional
     Conv1DTranspose
     Conv2DTranspose
     Conv3DTranspose
+    DepthwiseConv1D
     DepthwiseConv2D
-    DepthwiseConv2D
+    DepthwiseConv3D
     get_channel_index
 
 ConvND
@@ -368,12 +566,6 @@ Conv3DTranspose
 ~~~~~~~~~~~~~~~
 
 .. autoclass:: Conv3DTranspose
-   :members:
-
-DepthwiseConvND
-~~~~~~~~~~~~~~~
-
-.. autoclass:: DepthwiseConvND
    :members:
 
 DepthwiseConv1D
@@ -639,6 +831,22 @@ EmbedLookupStyle
 .. autoclass:: EmbedLookupStyle
    :members:
 
+Utilities
+---------
+
+.. currentmodule:: haiku
+
+.. autosummary::
+
+    Deferred
+
+Deferred
+~~~~~~~~
+
+.. autoclass:: Deferred
+   :members:
+
+
 Initializers
 ------------
 
@@ -889,6 +1097,7 @@ Control Flow
 
     cond
     fori_loop
+    map
     scan
     switch
     while_loop
@@ -902,6 +1111,11 @@ fori_loop
 ~~~~~~~~~
 
 .. autofunction:: fori_loop
+
+map
+~~~~~~~~~
+
+.. autofunction:: map
 
 scan
 ~~~~
@@ -925,7 +1139,6 @@ JAX Transforms
 
     eval_shape
     grad
-    jit
     remat
     value_and_grad
     vmap
@@ -939,11 +1152,6 @@ grad
 ~~~~
 
 .. autofunction:: grad
-
-jit
-~~~
-
-.. autofunction:: jit
 
 remat
 ~~~~~
@@ -974,6 +1182,7 @@ Automatic Mixed Precision
     current_policy
     get_policy
     clear_policy
+    push_policy
 
 set_policy
 ~~~~~~~~~~
@@ -995,47 +1204,28 @@ clear_policy
 
 .. autofunction:: clear_policy
 
+push_policy
+~~~~~~~~~~~~
+
+.. autofunction:: push_policy
+
 🚧 Experimental
 ===============
 
 .. automodule:: haiku.experimental
 
 
-TensorFlow Profiler
--------------------
-
-.. autosummary::
-
-    named_call
-    profiler_name_scopes
-
-named_call
-~~~~~~~~~~
-
-.. autofunction:: named_call
-
-profiler_name_scopes
-~~~~~~~~~~~~~~~~~~~~
-
-.. autofunction:: profiler_name_scopes
-
 Graphviz Visualisation
 ----------------------
 
 .. autosummary::
 
-    to_dot
     abstract_to_dot
 
 abstract_to_dot
 ~~~~~~~~~~~~~~~
 
 .. autofunction:: abstract_to_dot
-
-to_dot
-~~~~~~
-
-.. autofunction:: to_dot
 
 Summarisation
 -------------
@@ -1081,31 +1271,12 @@ Managing State
 
 .. autosummary::
 
-    name_scope
-    name_like
-    lift
-    lift_with_state
-    LiftWithStateUpdater
+    check_jax_usage
 
-name_scope
-~~~~~~~~~~
-
-.. autofunction:: name_scope
-
-name_like
-~~~~~~~~~
-
-.. autofunction:: name_like
-
-lift_with_state
+check_jax_usage
 ~~~~~~~~~~~~~~~
 
-.. autofunction:: lift_with_state
-
-LiftWithStateUpdater
-~~~~~~~~~~~~~~~~~~~~
-
-.. autoclass:: LiftWithStateUpdater
+.. autofunction:: check_jax_usage
 
 Optimizations
 -------------
@@ -1113,17 +1284,105 @@ Optimizations
 .. autosummary::
 
     optimize_rng_use
-    layer_stack
+    module_auto_repr
+    fast_eval_shape
+    rng_reserve_size
 
 optimize_rng_use
 ~~~~~~~~~~~~~~~~
 
 .. autofunction:: optimize_rng_use
 
-layer_stack
+module_auto_repr
 ~~~~~~~~~~~~~~~~
 
-.. autofunction:: layer_stack
+.. autofunction:: module_auto_repr
+
+fast_eval_shape
+~~~~~~~~~~~~~~~
+
+.. autofunction:: fast_eval_shape
+
+rng_reserve_size
+~~~~~~~~~~~~~~~~
+
+.. autofunction:: rng_reserve_size
+
+jaxpr_info
+----------
+
+.. automodule:: haiku.experimental.jaxpr_info
+
+.. autosummary::
+
+    make_model_info
+    as_html
+    as_html_page
+    css
+    format_module
+    js
+    Expression
+    Module
+
+make_model_info
+~~~~~~~~~~~~~~~
+
+.. autofunction:: make_model_info
+
+as_html
+~~~~~~~
+
+.. autofunction:: as_html
+
+as_html_page
+~~~~~~~~~~~~
+
+.. autofunction:: as_html_page
+
+css
+~~~
+
+.. autofunction:: css
+
+format_module
+~~~~~~~~~~~~~
+
+.. autofunction:: format_module
+
+js
+~~
+
+.. autofunction:: js
+
+Expression
+~~~~~~~~~~
+
+.. autoclass:: Expression
+
+Module
+~~~~~~
+
+.. autoclass:: Module
+
+Configuration
+=============
+
+.. automodule:: haiku.config
+
+.. autosummary::
+
+    context
+    set
+
+context
+-------
+
+.. autofunction:: context
+
+set
+---
+
+.. autofunction:: set
 
 Utilities
 =========

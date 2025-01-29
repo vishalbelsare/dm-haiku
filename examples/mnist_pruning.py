@@ -14,8 +14,8 @@
 # ==============================================================================
 """MNIST classifier with pruning as in https://arxiv.org/abs/1710.01878 ."""
 
+from collections.abc import Callable, Iterator, Mapping, Sequence
 import functools
-from typing import Callable, Generator, Mapping, Sequence, Tuple
 
 from absl import app
 import haiku as hk
@@ -26,12 +26,12 @@ import optax
 import tensorflow_datasets as tfds
 
 Batch = Mapping[str, np.ndarray]
-Predicate = Callable[[str, str, jnp.ndarray], bool]
-PredicateMap = Mapping[Predicate, jnp.ndarray]
-ModuleSparsity = Sequence[Tuple[Predicate, jnp.ndarray]]
+Predicate = Callable[[str, str, jax.Array], bool]
+PredicateMap = Mapping[Predicate, jax.Array]
+ModuleSparsity = Sequence[tuple[Predicate, jax.Array]]
 
 
-def topk_mask(value: jnp.ndarray, density_fraction: float) -> jnp.ndarray:
+def topk_mask(value: jax.Array, density_fraction: float) -> jax.Array:
   """Return a mask with 1s marking the top fraction of value.
 
   Note: This routine takes care to make sure that ties are handled without
@@ -60,7 +60,7 @@ def topk_mask(value: jnp.ndarray, density_fraction: float) -> jnp.ndarray:
   # with a bias to lower indices
   orig_shape = value.shape
   value = jnp.reshape(value, -1)
-  shuffled_indices = jax.random.shuffle(
+  shuffled_indices = jax.random.permutation(
       jax.random.PRNGKey(42), jnp.arange(0, jnp.size(value), dtype=jnp.int32))
 
   shuffled_mask = topk_mask_internal(value[shuffled_indices])
@@ -69,14 +69,14 @@ def topk_mask(value: jnp.ndarray, density_fraction: float) -> jnp.ndarray:
   return mask
 
 
-def zhugupta_func(progress: jnp.ndarray) -> jnp.ndarray:
+def zhugupta_func(progress: float) -> float:
   """From 'To Prune or Not To Prune' :cite:`zhu2017prune`."""
   return 1. - (1. - progress)**3
 
 
 def _create_partitions(
     module_sparsity: ModuleSparsity, params: hk.Params
-) -> Tuple[Sequence[hk.Params], Sequence[jnp.ndarray], hk.Params]:
+) -> tuple[Sequence[hk.Params], Sequence[jax.Array], hk.Params]:
   """Partition params based on sparsity_predicate_map.
 
   Args:
@@ -106,7 +106,7 @@ def _create_partitions(
   return list_of_trees, sparsity_list, tail
 
 
-def sparsity_ignore(m: str, n: str, v: jnp.ndarray) -> bool:
+def sparsity_ignore(m: str, n: str, v: jax.Array) -> bool:
   """Any parameter matching these conditions should generally not be pruned."""
   # n == 'b' when param is a bias
   return n == "b" or v.ndim == 1 or "batchnorm" in m or "batch_norm" in m
@@ -136,8 +136,7 @@ def apply_mask(params: hk.Params, masks: Sequence[hk.Params],
       module_sparsity, params)
   pruned_params = []
   for value, mask in zip(params_to_prune, masks):
-    pruned_params.append(
-        jax.tree_util.tree_multimap(lambda x, y: x * y, value, mask))
+    pruned_params.append(jax.tree.map(lambda x, y: x * y, value, mask))
   params = hk.data_structures.merge(*pruned_params, params_no_prune)
   return params
 
@@ -149,12 +148,12 @@ def update_mask(params: hk.Params, sparsity_fraction: float,
   params_to_prune, sparsities, _ = _create_partitions(module_sparsity, params)
   masks = []
 
-  def map_fn(x: jnp.ndarray, sparsity: float) -> jnp.ndarray:
+  def map_fn(x: jax.Array, sparsity: float) -> jax.Array:
     return topk_mask(jnp.abs(x), 1. - sparsity * sparsity_fraction)
 
   for tree, sparsity in zip(params_to_prune, sparsities):
     map_fn_sparsity = functools.partial(map_fn, sparsity=sparsity)
-    mask = jax.tree_util.tree_map(map_fn_sparsity, tree)
+    mask = jax.tree.map(map_fn_sparsity, tree)
     masks.append(mask)
   return masks
 
@@ -162,13 +161,13 @@ def update_mask(params: hk.Params, sparsity_fraction: float,
 @jax.jit
 def get_sparsity(params: hk.Params):
   """Calculate the total sparsity and tensor-wise sparsity of params."""
-  total_params = sum(jnp.size(x) for x in jax.tree_leaves(params))
-  total_nnz = sum(jnp.sum(x != 0.) for x in jax.tree_leaves(params))
-  leaf_sparsity = jax.tree_map(lambda x: jnp.sum(x == 0) / jnp.size(x), params)
+  total_params = sum(jnp.size(x) for x in jax.tree.leaves(params))
+  total_nnz = sum(jnp.sum(x != 0.0) for x in jax.tree.leaves(params))
+  leaf_sparsity = jax.tree.map(lambda x: jnp.sum(x == 0) / jnp.size(x), params)
   return total_params, total_nnz, leaf_sparsity
 
 
-def net_fn(batch: Batch) -> jnp.ndarray:
+def net_fn(batch: Batch) -> jax.Array:
   """Standard LeNet-300-100 MLP network."""
   x = batch["image"].astype(jnp.float32) / 255.
   mlp = hk.Sequential([
@@ -183,13 +182,15 @@ def net_fn(batch: Batch) -> jnp.ndarray:
 def load_dataset(
     split: str,
     *,
-    is_training: bool,
+    shuffle: bool,
     batch_size: int,
-) -> Generator[Batch, None, None]:
+) -> Iterator[Batch]:
   """Loads the dataset as a generator of batches."""
-  ds = tfds.load("mnist:3.*.*", split=split).cache().repeat()
-  if is_training:
-    ds = ds.shuffle(10 * batch_size, seed=0)
+  ds, ds_info = tfds.load("mnist:3.*.*", split=split, with_info=True)
+  ds.cache()
+  if shuffle:
+    ds = ds.shuffle(ds_info.splits[split].num_examples, seed=0)
+  ds = ds.repeat()
   ds = ds.batch(batch_size)
   return iter(tfds.as_numpy(ds))
 
@@ -212,12 +213,12 @@ def main(_):
 
   # Training loss (cross-entropy).
   @jax.jit
-  def loss(params: hk.Params, batch: Batch) -> jnp.ndarray:
+  def loss(params: hk.Params, batch: Batch) -> jax.Array:
     """Compute the loss of the network, including L2."""
     logits = net.apply(params, batch)
     labels = jax.nn.one_hot(batch["label"], 10)
 
-    l2_loss = 0.5 * sum(jnp.sum(jnp.square(p)) for p in jax.tree_leaves(params))
+    l2_loss = 0.5 * sum(jnp.sum(jnp.square(p)) for p in jax.tree.leaves(params))
     softmax_xent = -jnp.sum(labels * jax.nn.log_softmax(logits))
     softmax_xent /= labels.shape[0]
 
@@ -225,7 +226,7 @@ def main(_):
 
   # Evaluation metric (classification accuracy).
   @jax.jit
-  def accuracy(params: hk.Params, batch: Batch) -> jnp.ndarray:
+  def accuracy(params: hk.Params, batch: Batch) -> jax.Array:
     predictions = net.apply(params, batch)
     return jnp.mean(jnp.argmax(predictions, axis=-1) == batch["label"])
 
@@ -234,7 +235,7 @@ def main(_):
       params: hk.Params,
       opt_state: optax.OptState,
       batch: Batch,
-  ) -> Tuple[hk.Params, optax.OptState]:
+  ) -> tuple[hk.Params, optax.OptState]:
     """Learning rule (stochastic gradient descent)."""
     grads = jax.grad(loss)(params, batch)
     updates, opt_state = opt.update(grads, opt_state)
@@ -247,9 +248,9 @@ def main(_):
     return optax.incremental_update(params, avg_params, step_size=0.001)
 
   # Make datasets.
-  train = load_dataset("train", is_training=True, batch_size=1000)
-  train_eval = load_dataset("train", is_training=False, batch_size=10000)
-  test_eval = load_dataset("test", is_training=False, batch_size=10000)
+  train = load_dataset("train", shuffle=True, batch_size=1000)
+  train_eval = load_dataset("train", shuffle=False, batch_size=10000)
+  test_eval = load_dataset("test", shuffle=False, batch_size=10000)
 
   # Implemenation note: It is possible to avoid pruned_params and just use
   # a single params which progressively gets pruned.  The updates also don't

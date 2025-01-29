@@ -14,25 +14,32 @@
 # ==============================================================================
 """Testing utilities for Haiku."""
 
+from collections.abc import Callable, Generator, Sequence
 import functools
 import inspect
 import itertools
 import os
 import types
-from typing import Callable, Generator, Optional, Sequence, Tuple, TypeVar
+from typing import Any, TypeVar
 
 from absl.testing import parameterized
+from haiku._src import config
 from haiku._src import transform
-from jax import random
+import jax
 
 T = TypeVar("T")
 Fn = Callable[..., T]
+Key = Any  # NOTE: jax.random.PRNGKey is not actually a type.
 
 
-def transform_and_run(f: Optional[Fn] = None,
-                      seed: Optional[int] = 42,
-                      run_apply: bool = True,
-                      jax_transform: Optional[Callable[[Fn], Fn]] = None) -> T:
+def transform_and_run(
+    f: Fn | None = None,
+    seed: int | None = 42,
+    run_apply: bool = True,
+    jax_transform: Callable[[Fn], Fn] | None = None,
+    *,
+    map_rng: Callable[[Key], Key] | None = None,
+) -> T:
   r"""Transforms the given function and runs init then (optionally) apply.
 
   Equivalent to:
@@ -71,10 +78,32 @@ def transform_and_run(f: Optional[Fn] = None,
   Google Colaboratory:
 
   >>> f = lambda x: hk.Bias()(x)
-  >>> hk.testing.transform_and_run(f)(jnp.ones([1, 1]))
-  DeviceArray([[1.]], dtype=float32)
+  >>> print(hk.testing.transform_and_run(f)(jnp.ones([1, 1])))
+  [[1.]]
 
   See :func:`transform` for more details.
+
+  To use this with `pmap` (without ``chex``) you need to additionally pass in a
+  function to map the init/apply rng keys. For example, if you want every
+  instance of your pmap to have the same key:
+
+  >>> def same_key_on_all_devices(key):
+  ...   return jnp.broadcast_to(key, (jax.local_device_count(), *key.shape))
+
+  >>> @hk.testing.transform_and_run(jax_transform=jax.pmap,
+  ...                               map_rng=same_key_on_all_devices)
+  ... def test_something():
+  ...   ...
+
+  Or you can use a different key:
+
+  >>> def different_key_on_all_devices(key):
+  ...   return jax.random.split(key, jax.local_device_count())
+
+  >>> @hk.testing.transform_and_run(jax_transform=jax.pmap,
+  ...                               map_rng=different_key_on_all_devices)
+  ... def test_something_else():
+  ...   ...
 
   Args:
     f: A function method to transform.
@@ -82,6 +111,8 @@ def transform_and_run(f: Optional[Fn] = None,
     run_apply: Whether to run apply as well as init. Defaults to true.
     jax_transform: An optional jax transform to apply on the init and apply
       functions.
+    map_rng: If set to a non-None value broadcast the init/apply rngs
+      broadcast_rng-ways.
 
   Returns:
     A function that :func:`~haiku.transform`\ s ``f`` and runs ``init`` and
@@ -92,13 +123,17 @@ def transform_and_run(f: Optional[Fn] = None,
         transform_and_run,
         seed=seed,
         run_apply=run_apply,
-        jax_transform=jax_transform)
+        jax_transform=jax_transform,
+        map_rng=map_rng)
 
   @functools.wraps(f)
   def wrapper(*a, **k):
     """Runs init and apply of f."""
     if seed is not None:
-      init_rng, apply_rng = random.PRNGKey(seed), random.PRNGKey(seed+1)
+      init_rng, apply_rng = (jax.random.PRNGKey(seed),
+                             jax.random.PRNGKey(seed + 1))
+      if map_rng is not None:
+        init_rng, apply_rng = map(map_rng, (init_rng, apply_rng))
     else:
       init_rng, apply_rng = None, None
     init, apply = transform.transform_with_state(lambda: f(*a, **k))
@@ -114,9 +149,9 @@ def transform_and_run(f: Optional[Fn] = None,
 
 def find_internal_python_modules(
     root_module: types.ModuleType,
-) -> Sequence[Tuple[str, types.ModuleType]]:
+) -> Sequence[tuple[str, types.ModuleType]]:
   """Returns `(name, module)` for all Haiku submodules under `root_module`."""
-  modules = set([(root_module.__name__, root_module)])
+  modules = {(root_module.__name__, root_module)}
   visited = set()
   to_visit = [root_module]
 
@@ -142,10 +177,11 @@ def find_subclasses(
   seen = set()
   for _, module in find_internal_python_modules(root_python_module):
     for _, value in module.__dict__.items():
-      if inspect.isclass(value) and issubclass(value, base_class):
-        if value not in seen:
-          seen.add(value)
-          yield value
+      if not inspect.isclass(value) or isinstance(value, types.GenericAlias):
+        continue
+      if issubclass(value, base_class) and value not in seen:
+        seen.add(value)
+        yield value
 
 
 def combined_named_parameters(*parameters):
@@ -175,17 +211,17 @@ def combined_named_parameters(*parameters):
       functools.reduce(combine, r) for r in itertools.product(*parameters))
 
 
-def named_bools(name) -> Sequence[Tuple[str, bool]]:
+def named_bools(name) -> Sequence[tuple[str, bool]]:
   """Returns a pair of booleans suitable for use with ``named_parameters``."""
-  return (name, True), ("not_{}".format(name), False)
+  return (name, True), (f"not_{name}", False)
 
 
-def named_range(name, stop: int) -> Sequence[Tuple[str, int]]:
+def named_range(name, stop: int) -> Sequence[tuple[str, int]]:
   """Equivalent to `range()` but suitable for use with ``named_parameters``."""
-  return tuple(((f"{name}_{i}", i) for i in range(stop)))
+  return tuple((f"{name}_{i}", i) for i in range(stop))
 
 
-def with_environ(key: str, value: Optional[str]):
+def with_environ(key: str, value: str | None):
   """Runs the given test with envrionment variables set."""
   def set_env(new_value):
     if new_value is None:
@@ -205,3 +241,23 @@ def with_environ(key: str, value: Optional[str]):
     return wrapper
 
   return decorator
+
+
+def with_guardrails(f):
+  """Runs the given test with JAX guardrails on."""
+  @functools.wraps(f)
+  def wrapper(*a, **k):
+    old = config.check_jax_usage(True)
+    try:
+      return f(*a, **k)
+    finally:
+      config.check_jax_usage(old)
+  return wrapper
+
+
+def clone(key):
+  """Call jax.random.clone if it is available."""
+  if hasattr(jax.random, "clone"):
+    # JAX v0.4.26+
+    return jax.random.clone(key)
+  return key

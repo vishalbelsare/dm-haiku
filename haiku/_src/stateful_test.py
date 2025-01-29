@@ -14,44 +14,111 @@
 # ==============================================================================
 """Tests for haiku._src.stateful."""
 
-import functools
 import itertools as it
 
 from absl.testing import absltest
 from absl.testing import parameterized
 from haiku._src import base
+from haiku._src import base_test
+from haiku._src import config
+from haiku._src import initializers
 from haiku._src import module
 from haiku._src import stateful
 from haiku._src import test_utils
 from haiku._src import transform
 
 import jax
+from jax.extend import core as jax_core
 import jax.numpy as jnp
 import numpy as np
+
+toggle = lambda i, a: lambda x: a(x) if base.params_frozen() else i(x)
+
+
+# JAX transforms and control flow that need to be aware of Haiku internal
+# state to operate unsurprisingly.
+# pylint: disable=g-long-lambda
+HK_OVERLOADED_JAX_PURE_EXPECTING_FNS = (
+    # Just-in-time compilation.
+    ("jit", stateful.jit),
+
+    # ("make_jaxpr", stateful.make_jaxpr),
+    ("eval_shape", lambda f: (lambda x: [f(x), stateful.eval_shape(f, x)])),
+
+    # Parallelization.
+    # TODO(tomhennigan): Add missing features (e.g. pjit,xmap).
+    # ("pmap", lambda f: stateful.pmap(f, "i")),
+
+    # Vectorization.
+    ("vmap", lambda f: stateful.vmap(f, split_rng=False)),
+
+    # Control flow.
+    # TODO(tomhennigan): Enable for associative_scan.
+    # ("associative_scan", lambda f:
+    #  (lambda x: jax.lax.associative_scan(f, x))),
+    ("cond", lambda f: (lambda x: stateful.cond(True, f, f, x))),
+    ("fori_loop", lambda f:
+     (lambda x: stateful.fori_loop(0, 1, base_test.ignore_index(f), x))),
+    # ("map", lambda f: (lambda x: stateful.map(f, x))),
+    ("scan", lambda f:
+     (lambda x: stateful.scan(base_test.identity_carry(f), None, x))),
+    ("switch", lambda f: (lambda x: stateful.switch(0, [f, f], x))),
+    ("while_loop", lambda f: toggle(
+        f, lambda x: stateful.while_loop(lambda xs: xs[0] == 0,
+                                         lambda xs: (1, f(xs[1])),
+                                         (0, x)))),
+
+    # Automatic differentiation.
+    # TODO(tomhennigan): Add missing features (e.g. custom_vjp, custom_jvp).
+
+    ("grad", lambda f: stateful.grad(lambda x: f(x).sum())),
+    ("value_and_grad", lambda f: stateful.value_and_grad(lambda x: f(x).sum())),
+    ("checkpoint", stateful.remat),
+)
+# pylint: enable=g-long-lambda
+
+
+def with_rng_reserve_size(f):
+  """Run test with rng_reserve_size of 7."""
+  def wrapper(*a, **kw):
+    with config.context(rng_reserve_size=7):
+      return f(*a, **kw)
+  return wrapper
 
 
 class StatefulTest(parameterized.TestCase):
 
+  def assert_keys_equal(self, a, b):
+    self.assertEqual(jax.random.key_impl(a), jax.random.key_impl(b))
+    np.testing.assert_array_equal(
+        jax.random.key_data(a), jax.random.key_data(b)
+    )
+
+  def assert_keys_not_equal(self, a, b):
+    self.assertFalse(
+        (jax.random.key_impl(a) == jax.random.key_impl(b)) and
+        (jnp.all(jax.random.key_data(a) == jax.random.key_data(b))))
+
   @test_utils.transform_and_run
   def test_grad(self):
-    x = jnp.array(3.)
+    x = jnp.array(3.0)
     g = stateful.grad(SquareModule())(x)
     np.testing.assert_allclose(g, 2 * x, rtol=1e-4)
 
   def test_grad_no_transform(self):
-    x = jnp.array(3.)
+    x = jnp.array(3.0)
     with self.assertRaises(ValueError, msg="Use jax.grad() instead"):
       stateful.grad(jnp.square)(x)
 
   @test_utils.transform_and_run
   def test_value_and_grad(self):
-    x = jnp.array(2.)
+    x = jnp.array(2.0)
     y, g = stateful.value_and_grad(SquareModule())(x)
-    self.assertEqual(y, x ** 2)
+    self.assertEqual(y, x**2)
     np.testing.assert_allclose(g, 2 * x, rtol=1e-4)
 
   def test_value_and_grad_no_transform(self):
-    x = jnp.array(3.)
+    x = jnp.array(3.0)
     with self.assertRaises(ValueError, msg="Use jax.grad() instead"):
       stateful.value_and_grad(jnp.square)(x)
 
@@ -232,6 +299,40 @@ class StatefulTest(parameterized.TestCase):
     jax_call_count = len(witness)
     self.assertEqual(hk_call_count, jax_call_count)
 
+  @test_utils.transform_and_run
+  def test_cond_no_args(self):
+    x = stateful.cond(True, lambda: 5, lambda: 4)
+    self.assertEqual(x, 5)
+
+  @test_utils.transform_and_run
+  def test_cond_operand_kwarg(self):
+    x = stateful.cond(True, lambda x: x + 5, lambda x: x + 4, operand=1)
+    self.assertEqual(x, 6)
+
+  @test_utils.transform_and_run
+  def test_cond_operand_kwarg_and_operands(self):
+    with self.assertRaisesRegex(ValueError, "cannot.*pass.*positionally"):
+      stateful.cond(True, lambda x: x + 5, lambda x: x + 4, 1, operand=1)
+
+  @test_utils.transform_and_run
+  def test_cond_two_args(self):
+    a, b = stateful.cond(True,
+                         lambda a, b: (b, a),
+                         lambda a, b: (a, b),
+                         2, 1)
+    self.assertEqual(a, 1)
+    self.assertEqual(b, 2)
+
+  @test_utils.transform_and_run
+  def test_cond_three_args(self):
+    a, b, c = stateful.cond(True,
+                            lambda a, b, c: (c, b, a),
+                            lambda a, b, c: (a, b, c),
+                            3, 2, 1)
+    self.assertEqual(a, 1)
+    self.assertEqual(b, 2)
+    self.assertEqual(c, 3)
+
   def test_cond_no_transform(self):
     x = jnp.array(3.)
     with self.assertRaises(ValueError, msg="Use jax.cond() instead"):
@@ -250,6 +351,40 @@ class StatefulTest(parameterized.TestCase):
       out, state = f.apply(params, state, None, i, x)
       self.assertEqual(state, {"square_module": {"y": y}})
       self.assertEqual(out, y)
+
+  def test_switch_multiple_operands(self):
+    def f(i, x, y, z):
+      mod = SquareModule()
+      branches = [lambda x, y, z: mod(x),
+                  lambda y, x, z: mod(x),
+                  lambda y, z, x: mod(x),
+                  ]
+      return stateful.switch(i, branches, x, y, z)
+
+    f = transform.transform_with_state(f)
+    xyz = (1, 3, 5)
+    for i in range(3):
+      params, state = f.init(None, i, *xyz)
+      out, state = f.apply(params, state, None, i, *xyz)
+      expected_out = xyz[i]**2
+      self.assertEqual(state, {"square_module": {"y": expected_out}})
+      self.assertEqual(out, expected_out)
+
+  @test_utils.transform_and_run(run_apply=False)
+  def test_cond_branch_structure_error(self):
+    true_fn = lambda x: base.get_parameter("w", x.shape, x.dtype, init=jnp.ones)
+    false_fn = lambda x: x
+    with self.assertRaisesRegex(TypeError, "Hint: A common mistake"):
+      stateful.cond(False, true_fn, false_fn, 0)
+
+  @test_utils.transform_and_run(run_apply=False)
+  def test_switch_branch_structure_error(self):
+    branches = [
+        lambda x: base.get_parameter("w", x.shape, x.dtype, init=jnp.ones),
+        lambda x: x,
+    ]
+    with self.assertRaisesRegex(TypeError, "Hint: A common mistake"):
+      stateful.switch(0, branches, 0)
 
   @parameterized.parameters(1, 2, 4, 8)
   @test_utils.transform_and_run
@@ -289,7 +424,7 @@ class StatefulTest(parameterized.TestCase):
   def test_difference_empty(self):
     before = stateful.internal_state()
     after = stateful.internal_state()
-    self.assertEmpty(jax.tree_leaves(stateful.difference(before, after)))
+    self.assertEmpty(jax.tree.leaves(stateful.difference(before, after)))
 
   @parameterized.parameters(base.get_parameter, base.get_state)
   @test_utils.transform_and_run(run_apply=False)
@@ -333,7 +468,7 @@ class StatefulTest(parameterized.TestCase):
 
   def test_scan_no_transform(self):
     xs = jnp.arange(3)
-    with self.assertRaises(ValueError, msg="Use jax.scan() instead"):
+    with self.assertRaises(ValueError, msg="Use jax.lax.scan() instead"):
       stateful.scan(lambda c, x: (c, x), (), xs)
 
   @parameterized.parameters(0, 1, 2, 4, 8)
@@ -361,35 +496,29 @@ class StatefulTest(parameterized.TestCase):
 
   @parameterized.parameters(0, 1, 2, 8)
   @test_utils.transform_and_run
+  @with_rng_reserve_size
   def test_stateful_scan_with_rng_use(self, iteration_count):
-    # TODO(lenamartens): remove when default changes to > 1.
-    tmp_default = base.DEFAULT_PRNG_RESERVE_SIZE
-    base.DEFAULT_PRNG_RESERVE_SIZE = 64
     def body_fun(c, x):
       for _ in range(10):
         _ = base.next_rng_key()
       return c, x
     base.reserve_rng_keys(5)
     _ = stateful.scan(body_fun, (), (), length=iteration_count)
-    base.DEFAULT_PRNG_RESERVE_SIZE = tmp_default
 
   @parameterized.parameters(0, 1, 2, 8)
   @test_utils.transform_and_run
+  @with_rng_reserve_size
   def test_stateful_fori_with_rng_use(self, iteration_count):
-    tmp_default = base.DEFAULT_PRNG_RESERVE_SIZE
-    base.DEFAULT_PRNG_RESERVE_SIZE = 64
     def body_fun(_, x):
       for _ in range(10):
         _ = base.next_rng_key()
       return x
     base.reserve_rng_keys(5)
     _ = stateful.fori_loop(0, iteration_count, body_fun, 1)
-    base.DEFAULT_PRNG_RESERVE_SIZE = tmp_default
 
   @test_utils.transform_and_run
+  @with_rng_reserve_size
   def test_stateful_cond_with_rng_use(self):
-    tmp_default = base.DEFAULT_PRNG_RESERVE_SIZE
-    base.DEFAULT_PRNG_RESERVE_SIZE = 64
     # Test if using different amount of keys in different branches
     # results in error
     def true_branch(x):
@@ -404,12 +533,10 @@ class StatefulTest(parameterized.TestCase):
     base.reserve_rng_keys(5)
     _ = stateful.cond(True, true_branch, false_branch, 0)
     _ = stateful.cond(False, true_branch, false_branch, 0)
-    base.DEFAULT_PRNG_RESERVE_SIZE = tmp_default
 
   @test_utils.transform_and_run
+  @with_rng_reserve_size
   def test_stateful_switch_with_rng_use(self):
-    tmp_default = base.DEFAULT_PRNG_RESERVE_SIZE
-    base.DEFAULT_PRNG_RESERVE_SIZE = 64
     # Test if using different amount of keys in different branches
     # results in error
     def branch_f(i):
@@ -421,7 +548,19 @@ class StatefulTest(parameterized.TestCase):
     branches = [lambda _, i=i: branch_f(i) for i in range(5)]
     self.assertEqual(stateful.switch(3, branches, None), 3)
     self.assertEqual(stateful.switch(0, branches, None), 0)
-    base.DEFAULT_PRNG_RESERVE_SIZE = tmp_default
+
+  @test_utils.transform_and_run
+  def test_stateful_while_loop_with_rng_use(self):
+    def body_fun(i):
+      _ = base.next_rng_key()
+      _ = base.next_rng_key()
+      return i+1
+
+    base.reserve_rng_keys(5)
+    if transform.running_init():
+      body_fun(0)
+    else:
+      stateful.while_loop(lambda i: i < 7, body_fun, 0)  # does not crash.
 
   @parameterized.parameters(*it.product((0, 1, 2, 4, 8), (1, 2, 3)))
   @test_utils.transform_and_run
@@ -445,12 +584,25 @@ class StatefulTest(parameterized.TestCase):
     self.assertEqual(out, 4)
     self.assertEqual(m.count, 3)
 
+  @test_utils.transform_and_run
+  def test_map(self):
+    x = np.zeros((10, 10), dtype=np.float32)
+
+    def f(x):
+      self.assertLen(x.shape, 1)
+      return x + jax.random.uniform(base.next_rng_key())
+
+    if transform.running_init():
+      f(x[0])
+    else:
+      stateful.map(f, x)
+
   def test_vmap(self):
     def g(x):
       return CountingModule()(x)
 
     def f(x):
-      return stateful.vmap(g)(x)
+      return stateful.vmap(g, split_rng=False)(x)
 
     f = transform.transform_with_state(f)
 
@@ -459,7 +611,7 @@ class StatefulTest(parameterized.TestCase):
 
     # State should not be mapped.
     self.assertEmpty(params)
-    cnt, = jax.tree_leaves(state)
+    (cnt,) = jax.tree.leaves(state)
     self.assertEqual(cnt.ndim, 0)
     self.assertEqual(cnt, 0)
 
@@ -467,12 +619,12 @@ class StatefulTest(parameterized.TestCase):
     y, state = f.apply(params, state, None, x)
     self.assertEqual(y.shape, (4,))
     np.testing.assert_allclose(y, x ** 2)
-    cnt, = jax.tree_leaves(state)
+    (cnt,) = jax.tree.leaves(state)
     self.assertEqual(cnt.ndim, 0)
     self.assertEqual(cnt, 1)
 
   def test_vmap_must_be_called_in_transform(self):
-    f = stateful.vmap(lambda x: x)
+    f = stateful.vmap(lambda x: x, split_rng=False)
     with self.assertRaisesRegex(ValueError,
                                 "must be used as part of an.*hk.transform"):
       f(0)
@@ -483,14 +635,20 @@ class StatefulTest(parameterized.TestCase):
       pass
     with self.assertRaisesRegex(
         ValueError, "fn_name must have at least one non-None value in in_axes"):
-      stateful.vmap(fn_name, in_axes=None)
+      stateful.vmap(fn_name, in_axes=None, split_rng=False)
 
   @test_utils.transform_and_run
   def test_vmap_in_axes_different_size(self):
     x = jnp.ones([1, 2])
     with self.assertRaisesRegex(
         ValueError, "vmap got inconsistent sizes for array axes to be mapped"):
-      stateful.vmap(lambda a, b: None, in_axes=(0, 1))(x, x)
+      stateful.vmap(lambda a, b: None, in_axes=(0, 1), split_rng=False)(x, x)
+
+  @test_utils.transform_and_run
+  def test_vmap_in_axes_supports_list(self):
+    a = jnp.ones([4])
+    b = stateful.vmap(lambda a: a * 2, in_axes=[0], split_rng=False)(a)
+    np.testing.assert_array_equal(b, a * 2)
 
   @test_utils.transform_and_run
   def test_vmap_no_split_rng(self):
@@ -499,12 +657,12 @@ class StatefulTest(parameterized.TestCase):
     x = jnp.arange(4)
     k1, k2, k3, k4 = f(x)
     key_after = base.next_rng_key()
-    np.testing.assert_array_equal(k1, k2)
-    np.testing.assert_array_equal(k2, k3)
-    np.testing.assert_array_equal(k3, k4)
-    self.assertFalse(np.array_equal(key_before, k1))
-    self.assertFalse(np.array_equal(key_after, k1))
-    self.assertFalse(np.array_equal(key_before, key_after))
+    self.assert_keys_equal(k1, k2)
+    self.assert_keys_equal(k2, k3)
+    self.assert_keys_equal(k3, k4)
+    self.assert_keys_not_equal(key_before, k1)
+    self.assert_keys_not_equal(key_after, k1)
+    self.assert_keys_not_equal(key_before, key_after)
 
   @test_utils.transform_and_run
   def test_vmap_split_rng(self):
@@ -520,6 +678,37 @@ class StatefulTest(parameterized.TestCase):
       self.assertFalse(
           np.array_equal(a, b),
           msg=f"Keys should not be equal, but {a_name} == {b_name}")
+
+  @test_utils.transform_and_run(run_apply=False)
+  def test_vmap_split_rng_better_out_axes_error(self):
+    def creates_params(_):
+      base.get_parameter("mapped",
+                         (), jnp.float32,
+                         init=initializers.TruncatedNormal())
+    f = stateful.vmap(creates_params, split_rng=True)
+    x = jnp.arange(4)
+    with self.assertRaisesRegex(ValueError,
+                                "split_rng to True during initialization"):
+      f(x)
+
+  @test_utils.transform_and_run(run_apply=False)
+  def test_vmap_split_rng_out_axes_error_no_split_rng(self):
+    f = stateful.vmap(lambda x: x, split_rng=False, out_axes=None)
+    x = jnp.arange(4)
+    with self.assertRaisesRegex(ValueError, ".*vmap.*out_axes.*None.*"):
+      # test our split_rng error does not clobber jax error message.
+      f(x)
+
+  def test_vmap_split_rng_out_axes_error_no_init(self):
+    @transform.transform
+    def g(x):
+      f = stateful.vmap(lambda x: x, split_rng=True, out_axes=None)
+      f(x)
+
+    x = jnp.arange(4)
+    with self.assertRaisesRegex(ValueError, ".*vmap.*out_axes.*None.*"):
+      # test our split_rng error does not clobber jax error message.
+      g.apply({}, jax.random.PRNGKey(42), x)
 
   def test_while_loop_rejected_in_init(self):
     def f():
@@ -585,82 +774,6 @@ class StatefulTest(parameterized.TestCase):
                                rtol=1e-4)
     np.testing.assert_allclose(y, iters, rtol=1e-4)
 
-  def test_named_call(self):
-    def f(x):
-      return stateful.named_call(SquareModule(), name="square")(x)
-
-    x = jnp.array(2.)
-    rng = jax.random.PRNGKey(42)
-    init, apply = transform.transform_with_state(f)
-    params, state = init(rng, x)
-    y, state = jax.jit(apply)(params, state, rng, x)
-    self.assertEqual(y, x ** 2)
-
-  @parameterized.parameters(jax.jit, jax.grad, jax.vmap, jax.remat)
-  def test_named_call_jax_transforms(self, jax_transform):
-    f = jnp.sum
-    x = jnp.array([1.])
-
-    unnamed_out = jax_transform(f)(x)
-    named_out = jax_transform(stateful.named_call(f, name="test"))(x)
-
-    self.assertEqual(unnamed_out, named_out)
-
-  def test_static_argnums_named_call(self):
-    f = stateful.named_call(lambda x, y: y if x else None,
-                            name="test")
-    f = jax.jit(f, static_argnums=(0,))
-    out = f(True, 5)
-    self.assertEqual(out, 5)
-
-  def test_named_call_non_jaxtype_arg(self):
-    # For the test to fail without the invalid JaxType filter we need to pass
-    # in a valid JaxType that forces the invalid Jaxtype to be raised to an
-    # abstract value.
-    def f(not_a_jaxtype, a_jaxtype):
-      # then Jax needs to try and evaluate the abstractified non-JaxType
-      if not_a_jaxtype:
-        return a_jaxtype
-      return 0
-
-    f = stateful.named_call(f, name="test")
-    out = jax.jit(f, static_argnums=(0,))("not a Jaxtype", 1)
-    self.assertEqual(out, 1)
-
-  @parameterized.parameters("hi", None, object(), object)
-  def test_named_call_non_jaxtype_result(self, non_jaxtype):
-    def fun_with_non_jaxtype_output(x, non_jaxtype):
-      return x, non_jaxtype
-
-    def jitted_fun(x, non_jaxtype):
-      named_fun = stateful.named_call(fun_with_non_jaxtype_output)
-      # The non-jaxtype is returned out of named_call (which is supported),
-      # but is not returned out of the jit (which should not be supported).
-      x, non_jaxtype_out = named_fun(x, non_jaxtype)
-      self.assertEqual(non_jaxtype_out, non_jaxtype)
-      return x
-
-    jitted_fun = jax.jit(jitted_fun, static_argnums=1)
-    self.assertEqual(jitted_fun(0, non_jaxtype), 0)
-
-  def test_named_call_partial_function(self):
-    f = stateful.named_call(lambda x, y: y if x else None)
-    f = jax.jit(functools.partial(f, True))
-    out = f(5)
-    self.assertEqual(out, 5)
-
-  def test_named_call_default_name(self):
-    @stateful.named_call
-    def naming_things_is_hard(x):
-      return x ** 2
-
-    @jax.jit
-    def f(x):
-      return naming_things_is_hard(x) + naming_things_is_hard(x)
-
-    c = jax.xla_computation(f)(2)
-    self.assertIn("naming_things_is_hard", c.as_hlo_text())
-
   def test_eval_shape(self):
     def some_shape_changing_fun(x):
       return x[0, :]
@@ -703,6 +816,57 @@ class StatefulTest(parameterized.TestCase):
     with jax.checking_leaks():
       stateful.eval_shape(SquareModule(), jnp.ones(()))  # does not crash
 
+  @test_utils.combined_named_parameters(base_test.SIDE_EFFECTING_FUNCTIONS,
+                                        HK_OVERLOADED_JAX_PURE_EXPECTING_FNS)
+  @test_utils.transform_and_run
+  @test_utils.with_guardrails
+  def test_safe_use_of_jax(self, haiku_side_effect_fn, hk_jax_fn):
+    if "reserve_rng_keys_while_loop" in self._testMethodName:
+      self.skipTest("Expected not to work.")
+
+    # Make `f` identify with the side effecting function included.
+    f = hk_jax_fn(lambda x: [haiku_side_effect_fn(), x][1])
+    x = jnp.ones([1])
+    # These functions should not trigger exceptions from our guardrails.
+    f(x)
+
+  @test_utils.transform_and_run
+  def test_vmap_split_rng_with_default(self):
+    with self.assertRaisesRegex(TypeError,
+                                "hk.vmap.require_split_rng = False"):
+      # Intentionally missing split_rng arg.
+      stateful.vmap(lambda: None)
+
+    with self.subTest("require_split_rng=0"):
+      stateful.vmap.require_split_rng = False
+      try:
+        # This call should not trigger an error, even though we are missing the
+        # split_rng argument which appears required (if you look at the function
+        # signature). It only works because require_split_rng is
+        # propagated to vmap via a sneaky decorator. This only exists to support
+        # users who import code that they cannot edit (e.g. from a read only
+        # file system) that is not passing the argument.
+        f = stateful.vmap(base.next_rng_key, axis_size=2)
+      finally:
+        stateful.vmap.require_split_rng = True
+
+    # Check that split_rng=False was implied.
+    k1, k2 = f()
+    self.assertTrue((k1 == k2).all())
+
+  @parameterized.parameters(True, False)
+  @test_utils.transform_and_run
+  def test_vmap_split_rng_without_default(self, require_split_rng):
+    # Tests that when split_rng is passed explicitly the value of
+    # require_split_rng has no impact.
+    x = jnp.arange(2)
+    stateful.vmap.require_split_rng = require_split_rng
+    k1, k2 = stateful.vmap(lambda x: base.next_rng_key(), split_rng=True)(x)
+    self.assertTrue((k1 != k2).all())
+    k1, k2 = stateful.vmap(lambda x: base.next_rng_key(), split_rng=False)(x)
+    self.assertTrue((k1 == k2).all())
+    stateful.vmap.require_split_rng = True
+
 
 def _callback_prim(forward, backward):
   def f_impl(x):
@@ -713,10 +877,10 @@ def _callback_prim(forward, backward):
     backward()
     return (x,)
 
-  prim = jax.core.Primitive("hk_callback")
+  prim = jax_core.Primitive("hk_callback")
   prim.def_impl(f_impl)
   prim.def_abstract_eval(f_impl)
-  jax.ad.deflinear(prim, b_impl)
+  jax.interpreters.ad.deflinear(prim, b_impl)
   return prim.bind
 
 

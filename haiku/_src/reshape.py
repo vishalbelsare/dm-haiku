@@ -14,16 +14,18 @@
 # ==============================================================================
 """Reshaping Haiku modules."""
 
-import types
-from typing import Optional, Sequence
+from collections.abc import Sequence
 
 from haiku._src import module
 import jax.numpy as jnp
 import numpy as np
 
-# If you are forking replace this block with `import haiku as hk`.
-hk = types.ModuleType("haiku")
-hk.Module = module.Module
+
+# If you are forking replace this with `import haiku as hk`.
+# pylint: disable=invalid-name
+class hk:
+  Module = module.Module
+# pylint: enable=invalid-name
 del module
 
 
@@ -45,7 +47,7 @@ def _infer_shape(output_shape, dimensions):
   v = np.array(output_shape)
   m = abs(np.prod(v))
   # Replace wildcard.
-  v[v == -1] = n // m
+  v = [n // m if k == -1 else k for k in v]
   return tuple(v)
 
 
@@ -92,7 +94,7 @@ class Reshape(hk.Module):
       self,
       output_shape: Sequence[int],
       preserve_dims: int = 1,
-      name: Optional[str] = None,
+      name: str | None = None,
   ):
     """Constructs a :class:`Reshape` module.
 
@@ -168,7 +170,7 @@ class Flatten(Reshape):
   def __init__(
       self,
       preserve_dims: int = 1,
-      name: Optional[str] = None,
+      name: str | None = None,
   ):
     super().__init__(
         output_shape=(-1,),

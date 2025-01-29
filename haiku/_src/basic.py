@@ -14,25 +14,29 @@
 # ==============================================================================
 """Basic Haiku modules and functions."""
 
+from collections.abc import Callable, Iterable, Sequence
 import functools
-import types
-from typing import Any, Callable, Iterable, Optional, Type
-
+from typing import Any
 from haiku._src import base
 from haiku._src import initializers
 from haiku._src import module
+from haiku._src import typing
 from haiku._src.typing import PRNGKey
 import jax
 from jax import lax
 import jax.numpy as jnp
 import numpy as np
 
+
 # If you are forking replace this block with `import haiku as hk`.
-hk = types.ModuleType("haiku")
-hk.get_parameter = base.get_parameter
-hk.initializers = initializers
-hk.Module = module.Module
-del base, module, initializers
+# pylint: disable=invalid-name
+class hk:
+  get_parameter = base.get_parameter
+  initializers = initializers
+  Module = module.Module
+  SupportsCall = typing.SupportsCall
+# pylint: enable=invalid-name
+del base, module, initializers, typing
 
 
 # Utility and activation functions.
@@ -108,7 +112,7 @@ class Sequential(hk.Module):
   def __init__(
       self,
       layers: Iterable[Callable[..., Any]],
-      name: Optional[str] = None,
+      name: str | None = None,
   ):
     super().__init__(name=name)
     self.layers = tuple(layers)
@@ -131,9 +135,9 @@ class Linear(hk.Module):
       self,
       output_size: int,
       with_bias: bool = True,
-      w_init: Optional[hk.initializers.Initializer] = None,
-      b_init: Optional[hk.initializers.Initializer] = None,
-      name: Optional[str] = None,
+      w_init: hk.initializers.Initializer | None = None,
+      b_init: hk.initializers.Initializer | None = None,
+      name: str | None = None,
   ):
     """Constructs the Linear module.
 
@@ -155,10 +159,10 @@ class Linear(hk.Module):
 
   def __call__(
       self,
-      inputs: jnp.ndarray,
+      inputs: jax.Array,
       *,
-      precision: Optional[lax.Precision] = None,
-  ) -> jnp.ndarray:
+      precision: lax.Precision | None = None,
+  ) -> jax.Array:
     """Computes a linear transform of the input."""
     if not inputs.shape:
       raise ValueError("Input must not be scalar.")
@@ -184,16 +188,16 @@ class Linear(hk.Module):
 
 
 def ndim_at_least(x, num_dims):
-  if not isinstance(x, jnp.ndarray):
+  if not (isinstance(x, jax.Array) or isinstance(x, np.ndarray)):
     x = jnp.asarray(x)
   return x.ndim >= num_dims
 
 
 def arbitrary_mergeable_leaf(min_num_dims, args, kwargs):
-  for a in jax.tree_leaves(args):
+  for a in jax.tree.leaves(args):
     if ndim_at_least(a, min_num_dims):
       return a
-  for k in jax.tree_leaves(kwargs):
+  for k in jax.tree.leaves(kwargs):
     if ndim_at_least(k, min_num_dims):
       return k
   # Couldn't find a satisfactory leaf.
@@ -208,12 +212,12 @@ def merge_leading_dims(x, num_dims):
 
   # TODO(tomhennigan) Pass dtype here to account for empty slices.
   new_shape = (np.prod(x.shape[:num_dims]),) + x.shape[num_dims:]
-  return jnp.reshape(x, new_shape)
+  return x.reshape(new_shape)
 
 
 def split_leading_dim(x, to_dim):
   new_shape = to_dim + x.shape[1:]
-  return jnp.reshape(x, new_shape)
+  return x.reshape(new_shape)
 
 
 class BatchApply:
@@ -253,10 +257,10 @@ class BatchApply:
 
     merge = lambda x: merge_leading_dims(x, self.num_dims)
     split = lambda x: split_leading_dim(x, example.shape[:self.num_dims])
-    args = jax.tree_map(merge, args)
-    kwargs = jax.tree_map(merge, kwargs)
+    args = jax.tree.map(merge, args)
+    kwargs = jax.tree.map(merge, kwargs)
     outputs = self._f(*args, **kwargs)
-    return jax.tree_map(split, outputs)
+    return jax.tree.map(split, outputs)
 
 
 def expand_apply(f, axis=0):
@@ -264,9 +268,9 @@ def expand_apply(f, axis=0):
 
   Syntactic sugar for::
 
-      ins = jax.tree_util.tree_map(lambda t: np.expand_dims(t, axis=axis), ins)
+      ins = jax.tree.map(lambda t: np.expand_dims(t, axis=axis), ins)
       out = f(ins)
-      out = jax.tree_util.tree_map(lambda t: np.squeeze(t, axis=axis), out)
+      out = jax.tree.map(lambda t: np.squeeze(t, axis=axis), out)
 
   This may be useful for applying a function built for ``[Time, Batch, ...]``
   arrays to a single timestep.
@@ -284,15 +288,17 @@ def expand_apply(f, axis=0):
   @functools.wraps(f)
   def wrapper(*args, **kwargs):
     expand = lambda t: jnp.expand_dims(t, axis=axis)
-    args = jax.tree_map(expand, args)
-    kwargs = jax.tree_map(expand, kwargs)
+    args = jax.tree.map(expand, args)
+    kwargs = jax.tree.map(expand, kwargs)
     outputs = f(*args, **kwargs)
-    return jax.tree_map(lambda t: jnp.squeeze(t, axis=axis), outputs)
+    return jax.tree.map(lambda t: jnp.squeeze(t, axis=axis), outputs)
 
   return wrapper
 
 
-def dropout(rng: PRNGKey, rate: float, x: jnp.ndarray) -> jnp.ndarray:
+def dropout(
+    rng: PRNGKey, rate: float, x: jax.Array, broadcast_dims: Sequence[int] = ()
+) -> jax.Array:
   """Randomly drop units in the input at a given rate.
 
   See: http://www.cs.toronto.edu/~hinton/absps/dropout.pdf
@@ -302,6 +308,7 @@ def dropout(rng: PRNGKey, rate: float, x: jnp.ndarray) -> jnp.ndarray:
     rate: Probability that each element of ``x`` is discarded. Must be a scalar
       in the range ``[0, 1)``.
     x: The value to be dropped out.
+    broadcast_dims: specifies dimensions that will share the same dropout mask.
 
   Returns:
     x, but dropped out and scaled by ``1 / (1 - rate)``.
@@ -313,24 +320,44 @@ def dropout(rng: PRNGKey, rate: float, x: jnp.ndarray) -> jnp.ndarray:
     than what applications require. A work-around is to pass `rate` with a lower
     precision, e.g. using `np.float16(rate)`.
   """
-  if rate < 0 or rate >= 1:
-    raise ValueError("rate must be in [0, 1).")
+  return dropout_impl(rng, rate, x, broadcast_dims=broadcast_dims)
 
-  if rate == 0.0:
-    return x
+
+# Separated out to support monkey patching.
+def dropout_impl(
+    rng: PRNGKey, rate: float, x: jax.Array, broadcast_dims: Sequence[int] = ()
+) -> jax.Array:
+  """See dropout."""
+  try:
+    if rate < 0 or rate >= 1:
+      raise ValueError("rate must be in [0, 1).")
+
+    if rate == 0.0:
+      return x
+  except jax.errors.ConcretizationTypeError:
+    pass
+
+  broadcast_shape = list(x.shape)
+  for dim in broadcast_dims:
+    if dim > len(broadcast_shape):
+      raise ValueError("Broadcast dimension does not exist. Got dimension "
+                       f"{dim} for shape {broadcast_shape}.")
+    broadcast_shape[dim] = 1
 
   keep_rate = 1.0 - rate
-  keep = jax.random.bernoulli(rng, keep_rate, shape=x.shape)
+  keep = jax.random.bernoulli(rng, keep_rate, shape=broadcast_shape)
+  keep = jnp.broadcast_to(keep, x.shape)
   return keep * x / keep_rate
 
 
+# TODO(tomhennigan): Fix internal tests and replace with `hk.SupportsCall`.
 class CallableModule(hk.Module):
 
   def __call__(self, *args, **kwargs) -> Any:
     raise NotImplementedError
 
 
-def to_module(f: Callable[..., Any]) -> Type[CallableModule]:
+def to_module(f: Callable[..., Any]) -> type[CallableModule]:
   """Converts a function into a callable module class.
 
   Sample usage:
